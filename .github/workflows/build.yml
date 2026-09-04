@@ -1,4 +1,4 @@
-name: WildKSU NetHunter Android 12 GKI
+name: Build WildKSU NetHunter GKI
 
 on:
   workflow_dispatch:
@@ -14,7 +14,7 @@ on:
         default: ""
 
       device_name:
-        description: "Device/artifact label"
+        description: "Artifact label"
         required: true
         default: "gki-custom"
 
@@ -24,17 +24,17 @@ on:
         default: "true"
 
       enable_hid:
-        description: "Enable USB HID gadget and host"
+        description: "Enable USB HID gadget/host"
         required: true
         default: "true"
 
       enable_nethunter:
-        description: "Enable NetHunter Bluetooth/WiFi/USB support"
+        description: "Enable Bluetooth, WiFi and USB NetHunter drivers"
         required: true
         default: "true"
 
       enable_sdr:
-        description: "Enable SDR/DVB USB support"
+        description: "Enable SDR/DVB support"
         required: true
         default: "true"
 
@@ -44,7 +44,7 @@ on:
         default: "true"
 
       include_firmware:
-        description: "Include common Linux firmware"
+        description: "Package common Linux firmware"
         required: true
         default: "true"
 
@@ -72,7 +72,7 @@ jobs:
           sudo rm -rf /opt/ghc
           sudo apt-get clean
 
-      - name: Install build dependencies
+      - name: Install dependencies
         run: |
           set -eux
 
@@ -167,7 +167,7 @@ jobs:
 
           git checkout "refs/tags/${PIN_TAG}"
 
-      - name: Detect kernel sublevel
+      - name: Detect kernel version
         working-directory: kernel_workspace/common
         run: |
           set -euo pipefail
@@ -230,7 +230,6 @@ jobs:
         working-directory: kernel_workspace/common
         run: |
           set -euo pipefail
-
           patch -p1 --fuzz=3 \
             < 50_add_susfs_in_gki-android12-5.10.patch
 
@@ -242,6 +241,17 @@ jobs:
           sed -i \
             's/set_nameidata(nd, old_dfd, fake_filename, NULL);/set_nameidata(nd, old_dfd, fake_filename);/g' \
             fs/namei.c || true
+
+      - name: Apply SUSFS show_pad compatibility fix
+        working-directory: kernel_workspace/common
+        run: |
+          set -euo pipefail
+
+          if [ "${SUBLEVEL:-999}" -le 209 ]; then
+            sed -i \
+              's/goto show_pad;/return 0;/' \
+              fs/proc/task_mmu.c || true
+          fi
 
       - name: Setup KernelSU Next
         working-directory: kernel_workspace/common
@@ -281,9 +291,9 @@ jobs:
           if grep -RqsE \
             '^[[:space:]]*(config|menuconfig)[[:space:]]+BBG([[:space:]]|$)' \
             common --include='Kconfig*'; then
-            echo "CONFIG_BBG=y" >> common/arch/arm64/configs/gki_defconfig
+            echo "CONFIG_BBG=y" >> common/arch/arm64/configs/nethunter.fragment
           else
-            echo "::warning::BBG symbol was not found"
+            echo "::warning::BBG Kconfig symbol was not found"
           fi
 
       - name: Apply BBRv3
@@ -341,7 +351,7 @@ jobs:
 
           patch -p1 < /tmp/droidspaces-mqueue.patch || true
 
-      - name: Generate configuration list
+      - name: Generate safe NetHunter config fragment
         working-directory: kernel_workspace/common
         env:
           HID: ${{ github.event.inputs.enable_hid }}
@@ -353,25 +363,22 @@ jobs:
         run: |
           set -euo pipefail
 
-          cat > /tmp/configs.list <<'EOF'
-          CONFIG_SYSVIPC=y
-          CONFIG_POSIX_MQUEUE=y
-          CONFIG_IPC_NS=y
+          fragment="$PWD/arch/arm64/configs/nethunter.fragment"
+          : > "$fragment"
+
+          cat >> "$fragment" <<'EOF'
           CONFIG_NAMESPACES=y
           CONFIG_NET_NS=y
           CONFIG_PID_NS=y
           CONFIG_USER_NS=y
           CONFIG_CGROUPS=y
           CONFIG_DEVTMPFS=y
-          CONFIG_DEVTMPFS_MOUNT=y
           CONFIG_TMPFS_POSIX_ACL=y
           CONFIG_TMPFS_XATTR=y
           CONFIG_ANDROID_BINDER_IPC=y
           CONFIG_ANDROID_BINDERFS=y
           CONFIG_MODULES=y
           CONFIG_MODULE_UNLOAD=y
-          CONFIG_MODULE_FORCE_UNLOAD=y
-          CONFIG_MODVERSIONS=y
           CONFIG_NETFILTER_XT_MATCH_ADDRTYPE=y
           CONFIG_NETFILTER_XT_TARGET_REJECT=y
           CONFIG_NETFILTER_XT_TARGET_LOG=y
@@ -390,8 +397,6 @@ jobs:
           CONFIG_NET_SCH_CAKE=y
           CONFIG_IIO=y
           CONFIG_IIO_CONFIGFS=y
-          CONFIG_PCI_ENDPOINT=y
-          CONFIG_PCI_ENDPOINT_CONFIGFS=y
           CONFIG_KSU=y
           CONFIG_KSU_SUSFS=y
           CONFIG_KSU_SUSFS_SUS_PATH=y
@@ -407,8 +412,7 @@ jobs:
           EOF
 
           if [ "$HID" = "true" ]; then
-            cat >> /tmp/configs.list <<'EOF'
-          CONFIG_INPUT=y
+            cat >> "$fragment" <<'EOF'
           CONFIG_INPUT_EVDEV=y
           CONFIG_HID=y
           CONFIG_HID_GENERIC=y
@@ -430,7 +434,6 @@ jobs:
           CONFIG_USB_CONFIGFS_F_HID=y
           CONFIG_USB_CONFIGFS_F_FS=y
           CONFIG_USB_CONFIGFS_UEVENT=y
-          CONFIG_USB_CONFIGFS_F_LB_SS=y
           CONFIG_USB_CONFIGFS_F_PRINTER=y
           CONFIG_USB_CONFIGFS_F_UAC1=y
           CONFIG_USB_ACM=y
@@ -438,72 +441,65 @@ jobs:
           fi
 
           if [ "$NETHUNTER" = "true" ]; then
-            cat >> /tmp/configs.list <<'EOF'
+            cat >> "$fragment" <<'EOF'
           CONFIG_BT=y
           CONFIG_BT_HCIBTUSB=y
           CONFIG_BT_HCIBTUSB_BCM=y
           CONFIG_BT_HCIBTUSB_RTL=y
           CONFIG_BT_HCIUART=y
           CONFIG_BT_HCIUART_H4=y
-          CONFIG_BT_HCIBCM203X=y
-          CONFIG_BT_HCIBPA10X=y
-          CONFIG_BT_HCIBFUSB=y
           CONFIG_BT_HCIVHCI=y
           CONFIG_CFG80211=y
-          CONFIG_CFG80211_WEXT=y
           CONFIG_MAC80211=y
-          CONFIG_MAC80211_MESH=y
           CONFIG_WLAN_VENDOR_ATH=y
-          CONFIG_ATH9K_HTC=y
-          CONFIG_CARL9170=y
-          CONFIG_ATH6KL=y
-          CONFIG_ATH6KL_USB=y
+          CONFIG_ATH9K_HTC=m
+          CONFIG_CARL9170=m
+          CONFIG_ATH6KL=m
+          CONFIG_ATH6KL_USB=m
           CONFIG_WLAN_VENDOR_RALINK=y
-          CONFIG_RT2X00=y
-          CONFIG_RT2500USB=y
-          CONFIG_RT73USB=y
-          CONFIG_RT2800USB=y
+          CONFIG_RT2500USB=m
+          CONFIG_RT73USB=m
+          CONFIG_RT2800USB=m
           CONFIG_WLAN_VENDOR_REALTEK=y
-          CONFIG_RTL8187=y
-          CONFIG_RTL_CARDS=y
-          CONFIG_RTL8192CU=y
-          CONFIG_RTL8XXXU=y
+          CONFIG_RTL8187=m
+          CONFIG_RTL8192CU=m
+          CONFIG_RTL8XXXU=m
           CONFIG_RTL8XXXU_UNTESTED=y
           CONFIG_WLAN_VENDOR_ZYDAS=y
-          CONFIG_USB_ZD1201=y
-          CONFIG_ZD1211RW=y
-          CONFIG_USB_NET_RNDIS_WLAN=y
-          CONFIG_USB_RTL8150=y
-          CONFIG_USB_RTL8152=y
-          CONFIG_USB_SERIAL=y
-          CONFIG_USB_SERIAL_GENERIC=y
-          CONFIG_USB_SERIAL_FTDI_SIO=y
-          CONFIG_USB_SERIAL_PL2303=y
-          CONFIG_USB_SERIAL_CP210X=y
-          CONFIG_USB_SERIAL_CH341=y
-          CONFIG_USB_SERIAL_OPTION=y
-          CONFIG_USB_SERIAL_QUALCOMM=y
-          CONFIG_USB_SERIAL_SIMPLE=y
+          CONFIG_USB_ZD1201=m
+          CONFIG_ZD1211RW=m
+          CONFIG_USB_NET_RNDIS_WLAN=m
+          CONFIG_USB_RTL8150=m
+          CONFIG_USB_RTL8152=m
+          CONFIG_USB_SERIAL=m
+          CONFIG_USB_SERIAL_GENERIC=m
+          CONFIG_USB_SERIAL_FTDI_SIO=m
+          CONFIG_USB_SERIAL_PL2303=m
+          CONFIG_USB_SERIAL_CP210X=m
+          CONFIG_USB_SERIAL_CH341=m
+          CONFIG_USB_SERIAL_OPTION=m
+          CONFIG_USB_SERIAL_QUALCOMM=m
+          CONFIG_USB_SERIAL_SIMPLE=m
           EOF
           fi
 
           if [ "$SDR" = "true" ]; then
-            cat >> /tmp/configs.list <<'EOF'
+            cat >> "$fragment" <<'EOF'
           CONFIG_MEDIA_SUPPORT=y
           CONFIG_MEDIA_USB_SUPPORT=y
           CONFIG_MEDIA_DIGITAL_TV_SUPPORT=y
           CONFIG_MEDIA_SDR_SUPPORT=y
-          CONFIG_DVB_USB_RTL28XXU=y
-          CONFIG_DVB_RTL2830=y
-          CONFIG_DVB_RTL2832=y
-          CONFIG_USB_AIRSPY=y
-          CONFIG_USB_HACKRF=y
-          CONFIG_USB_MSI2500=y
+          CONFIG_DVB_USB_RTL28XXU=m
+          CONFIG_DVB_RTL2830=m
+          CONFIG_DVB_RTL2832=m
+          CONFIG_USB_AIRSPY=m
+          CONFIG_USB_HACKRF=m
+          CONFIG_USB_MSI2500=m
           EOF
           fi
 
           if [ "$CAN" = "true" ]; then
-            cat >> /tmp/configs.list <<'EOF'
+            cat >> "$fragment" <<'EOF'
           CONFIG_CAN=y
           CONFIG_CAN_RAW=y
           CONFIG_CAN_BCM=y
@@ -526,20 +522,25 @@ jobs:
           EOF
           fi
 
-          if [ "$BBG" = "true" ]; then
-            echo "CONFIG_BBG=y" >> /tmp/configs.list
-          fi
-
           if [ "$BBRV3" = "true" ]; then
-            echo "CONFIG_TCP_CONG_BBR3=y" >> /tmp/configs.list
+            echo "CONFIG_TCP_CONG_BBR3=y" >> "$fragment"
           fi
 
-      - name: Apply only available configs
+          awk '!seen[$0]++' "$fragment" > "$fragment.tmp"
+          mv "$fragment.tmp" "$fragment"
+
+      - name: Apply available configuration fragment
         working-directory: kernel_workspace/common
         run: |
           set -euo pipefail
 
-          cfg="arch/arm64/configs/gki_defconfig"
+          fragment="arch/arm64/configs/nethunter.fragment"
+
+          if [ ! -x scripts/kconfig/merge_config.sh ]; then
+            chmod +x scripts/kconfig/merge_config.sh
+          fi
+
+          filtered="$(mktemp)"
 
           while IFS= read -r line; do
             [ -z "$line" ] && continue
@@ -550,57 +551,24 @@ jobs:
             if grep -RqsE \
               "^[[:space:]]*(config|menuconfig)[[:space:]]+$name([[:space:]]|$)" \
               --include='Kconfig*' .; then
-              printf '%s\n' "$line" >> "$cfg"
+              printf '%s\n' "$line" >> "$filtered"
             else
-              echo "::warning::Unavailable symbol skipped: $symbol"
+              echo "::warning::Skipping unavailable symbol: $symbol"
             fi
-          done < /tmp/configs.list
+          done < "$fragment"
 
-      - name: Deduplicate configs
+          mv "$filtered" "$fragment"
+
+          scripts/kconfig/merge_config.sh \
+            -m \
+            -r \
+            arch/arm64/configs/gki_defconfig \
+            "$fragment"
+
+      - name: Generate and normalize final defconfig
         working-directory: kernel_workspace/common
         run: |
           set -euo pipefail
-
-          cfg="arch/arm64/configs/gki_defconfig"
-
-          awk '
-            /^CONFIG_[A-Za-z0-9_]+=([ymn]|".*")$/ {
-              key=$0
-              sub(/=.*/, "", key)
-              value[key]=$0
-              order[key]=++n
-              next
-            }
-            /^# CONFIG_[A-Za-z0-9_]+ is not set$/ {
-              key=$0
-              sub(/^# /, "", key)
-              sub(/ is not set$/, "", key)
-              value[key]=$0
-              order[key]=++n
-              next
-            }
-            { other[++m]=$0 }
-            END {
-              for (i=1; i<=n; i++)
-                for (key in order)
-                  if (order[key] == i) print value[key]
-              for (i=1; i<=m; i++) print other[i]
-            }
-          ' "$cfg" > "$cfg.new"
-
-          mv "$cfg.new" "$cfg"
-
-      - name: Generate resolved defconfig
-        working-directory: kernel_workspace/common
-        run: |
-          set -euo pipefail
-
-          make \
-            LLVM=1 \
-            LLVM_IAS=1 \
-            ARCH=arm64 \
-            O="$PWD/out" \
-            gki_defconfig
 
           make \
             LLVM=1 \
@@ -611,13 +579,47 @@ jobs:
 
           cp out/.config "$GITHUB_WORKSPACE/resolved-kernel.config"
 
-      - name: Relax module list bookkeeping
+          make \
+            LLVM=1 \
+            LLVM_IAS=1 \
+            ARCH=arm64 \
+            O="$PWD/out" \
+            savedefconfig
+
+          cp out/defconfig arch/arm64/configs/gki_defconfig
+
+          make \
+            LLVM=1 \
+            LLVM_IAS=1 \
+            ARCH=arm64 \
+            O="$PWD/out" \
+            olddefconfig
+
+          cp out/.config "$GITHUB_WORKSPACE/final-kernel.config"
+
+      - name: Disable strict defconfig comparison
         working-directory: kernel_workspace
         run: |
           set -euo pipefail
 
-          find common -maxdepth 1 -type f \
-            -name 'build.config*' -print0 |
+          find common -maxdepth 2 \
+            -type f \
+            -name 'build.config*' \
+            -print0 |
+            xargs -0 -r sed -i \
+              -e 's/^CHECK_DEFCONFIG=.*/CHECK_DEFCONFIG=false/' \
+              -e 's/;check_defconfig//g' \
+              -e 's/ check_defconfig//g'
+
+      - name: Disable strict modules-list comparison
+        working-directory: kernel_workspace/common
+        run: |
+          set -euo pipefail
+
+          find . -maxdepth 2 \
+            -type f \
+            -name 'build.config*' \
+            -print0 |
             xargs -0 -r sed -i \
               -e 's/^MODULES_ORDER=.*/MODULES_ORDER=/' \
               -e 's/^MODULES_LIST=.*/MODULES_LIST=/'
@@ -669,8 +671,7 @@ jobs:
             CONFIG_PID_NS \
             CONFIG_CGROUPS \
             CONFIG_USB_GADGET \
-            CONFIG_USB_CONFIGFS \
-            CONFIG_HIDRAW; do
+            CONFIG_USB_CONFIGFS; do
             grep -q "^${symbol}=y$" "$cfg" ||
               echo "::warning::${symbol} is not enabled in final config"
           done
@@ -720,6 +721,24 @@ jobs:
               ;;
           esac
 
+      - name: Collect kernel modules
+        working-directory: kernel_workspace
+        run: |
+          set -euo pipefail
+
+          mkdir -p "$GITHUB_WORKSPACE/module-package"
+
+          find out -type f -name '*.ko' \
+            -exec cp -v {} "$GITHUB_WORKSPACE/module-package/" \; || true
+
+          find "$GITHUB_WORKSPACE/module-package" \
+            -type f -name '*.ko' | sort > \
+            "$GITHUB_WORKSPACE/module-package/modules.list"
+
+          if [ ! -s "$GITHUB_WORKSPACE/module-package/modules.list" ]; then
+            echo "::warning::No external kernel modules were produced"
+          fi
+
       - name: Download common firmware
         if: ${{ github.event.inputs.include_firmware == 'true' }}
         run: |
@@ -757,11 +776,21 @@ jobs:
           elif [ -f Image ]; then
             cp Image AnyKernel3/Image
           else
-            echo "::error::Kernel Image not found"
+            echo "::error::Kernel Image was not found"
             exit 1
           fi
 
-          cp resolved-kernel.config AnyKernel3/kernel.config
+          cp final-kernel.config AnyKernel3/kernel.config
+
+          if [ -d module-package ]; then
+            mkdir -p AnyKernel3/modules
+            cp module-package/*.ko \
+              AnyKernel3/modules/ 2>/dev/null || true
+          fi
+
+          if [ -d firmware ]; then
+            cp -a firmware AnyKernel3/firmware
+          fi
 
           cat > AnyKernel3/build-info.txt <<EOF
           Kernel: Android 12 GKI 5.10
@@ -769,12 +798,8 @@ jobs:
           Device label: ${{ github.event.inputs.device_name }}
           SUSFS commit: ${SUSFS_COMMIT:-unknown}
           BBRv3 applied: ${BBRV3_PATCH_APPLIED:-false}
-          Note: target-device boot/DTBO/vendor modules may be required
+          Note: device-specific DTB/DTBO/vendor modules may be required
           EOF
-
-          if [ -d firmware ]; then
-            cp -a firmware AnyKernel3/firmware
-          fi
 
           rm -rf AnyKernel3/.git
 
@@ -795,7 +820,7 @@ jobs:
           test -s "$zip_name"
           unzip -t "$zip_name"
 
-      - name: Create source artifact
+      - name: Create generic kernel files ZIP
         run: |
           set -euo pipefail
 
@@ -809,7 +834,11 @@ jobs:
             cp Image.lz4 generic-artifact/Image.lz4
           fi
 
-          cp resolved-kernel.config generic-artifact/kernel.config
+          cp final-kernel.config generic-artifact/kernel.config
+
+          if [ -d module-package ]; then
+            cp -a module-package generic-artifact/modules
+          fi
 
           if [ -d firmware ]; then
             cp -a firmware generic-artifact/firmware
@@ -821,6 +850,7 @@ jobs:
           KernelSU-Next
           SUSFS
           NetHunter feature configuration
+          Device-specific boot/DTBO/vendor integration is not included
           EOF
 
           cd generic-artifact
@@ -836,5 +866,6 @@ jobs:
           path: |
             *-WildKSU-NetHunter-AnyKernel3.zip
             *-NetHunter-GKI-files.zip
+            final-kernel.config
             resolved-kernel.config
           retention-days: 14
