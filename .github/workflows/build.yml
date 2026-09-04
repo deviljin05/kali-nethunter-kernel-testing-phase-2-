@@ -148,11 +148,11 @@ jobs:
         run: |
           set -euo pipefail
           if [ "${SUBLEVEL}" -le "43" ]; then
-            perl -i -pe 's/(int|size_t)s+this_lens*=s*min_ts*(s*\u0001s*,/size_t this_len = min_t(size_t,/' fs/proc/base.c
+            perl -i -pe 's/(int|size_t)\s+this_len\s*=\s*min_t\s*\(\s*\1\s*,/size_t this_len = min_t(size_t,/' fs/proc/base.c
           fi
           if [ "${SUBLEVEL}" -le "117" ]; then
-            sed -i '#^[[:space:]]*/*$#,#^[[:space:]]*u32 mask = mark->mask & IN_ALL_EVENTS;$#d' fs/notify/fdinfo.c
-            perl -i -pe 's/\bmask,s*mark->ignored_mask/inotify_mark_user_mask(mark)/g' fs/notify/fdinfo.c
+            sed -i '\#^[[:space:]]*/\*$#,\#^[[:space:]]*u32 mask = mark->mask & IN_ALL_EVENTS;$#d' fs/notify/fdinfo.c
+            perl -i -pe 's/\bmask,\s*mark->ignored_mask/inotify_mark_user_mask(mark)/g' fs/notify/fdinfo.c
             perl -i -pe 's/ignored_mask:%x/ignored_mask:0/g' fs/notify/fdinfo.c
           fi
 
@@ -176,7 +176,7 @@ jobs:
             sed -i 's/^size_t this_len = min_t(size_t, count, PAGE_SIZE);$/int this_len = min_t(int, count, PAGE_SIZE);/' fs/proc/base.c
           fi
           if [ "${SUBLEVEL}" -le "117" ]; then
-            perl -i -pe 's#^(s+if (inode) {)#$1
+            perl -i -pe 's#^(\s+if \(inode\) \{)#$1
             \t\t/*
             \t\t * IN_ALL_EVENTS represents all of the mask bits
             \t\t * that we expose to userspace.  There is at
@@ -184,7 +184,7 @@ jobs:
             \t\t * used only internally to the kernel.
             \t\t */
             \t\tu32 mask = mark->mask & IN_ALL_EVENTS;#m' fs/notify/fdinfo.c
-            perl -i -pe 's/\binotify_mark_user_mask(mark)/mask, mark->ignored_mask/g' fs/notify/fdinfo.c
+            perl -i -pe 's/\binotify_mark_user_mask\(mark\)/mask, mark->ignored_mask/g' fs/notify/fdinfo.c
             perl -i -pe 's/ignored_mask:0/ignored_mask:%x/g' fs/notify/fdinfo.c
           fi
 
@@ -240,7 +240,7 @@ jobs:
           BBRV3_PATCH_APPLIED="false"
           if [ -f "$BBRV3_PATCH" ] && patch -p1 < "$BBRV3_PATCH"; then
             BBRV3_PATCH_APPLIED="true"
-            DETECTED="$(grep -rhoE '.names*=s*"[a-zA-Z0-9_]+"' net/ipv4/tcp_bbr*.c 2>/dev/null | grep -oE '"[a-zA-Z0-9_]+"' | tr -d '"' | head -n1 || true)"
+            DETECTED="$(grep -rhoE '\.name\s*=\s*"[a-zA-Z0-9_]+"' net/ipv4/tcp_bbr*.c 2>/dev/null | grep -oE '"[a-zA-Z0-9_]+"' | tr -d '"' | head -n1 || true)"
             [ -n "$DETECTED" ] && BBR_CONG_NAME="$DETECTED"
           fi
           echo "BBR_CONG_NAME=${BBR_CONG_NAME}" >> "$GITHUB_ENV"
@@ -388,4 +388,134 @@ jobs:
           } >> gki_defconfig
 
       - name: Set Kali NetHunter Bluetooth/WiFi/SDR configs
-        if: ${{ github.event.inputs.e
+        if: ${{ github.event.inputs.enable_nethunter == 'true' }}
+        run: |
+          cd kernel_workspace/common/arch/arm64/configs
+          {
+            echo "CONFIG_BT_HCIBTUSB=y"
+            echo "CONFIG_BT_HCIBTUSB_BCM=y"
+            echo "CONFIG_BT_HCIBTUSB_RTL=y"
+            echo "CONFIG_BT_HCIUART=y"
+            echo "CONFIG_BT_HCIUART_H4=y"
+            echo "CONFIG_BT_HCIBCM203X=y"
+            echo "CONFIG_BT_HCIBPA10X=y"
+            echo "CONFIG_BT_HCIBFUSB=y"
+            echo "CONFIG_BT_HCIVHCI=y"
+            echo "CONFIG_CFG80211_WEXT=y"
+            echo "CONFIG_MAC80211=y"
+            echo "CONFIG_WLAN_VENDOR_ATH=y"
+            echo "CONFIG_ATH9K_HTC=y"
+            echo "CONFIG_CARL9170=y"
+            echo "CONFIG_ATH6KL=y"
+            echo "CONFIG_ATH6KL_USB=y"
+            echo "CONFIG_WLAN_VENDOR_RALINK=y"
+            echo "CONFIG_RT2X00=y"
+            echo "CONFIG_RT2500USB=y"
+            echo "CONFIG_RT73USB=y"
+            echo "CONFIG_RT2800USB=y"
+            echo "CONFIG_WLAN_VENDOR_REALTEK=y"
+            echo "CONFIG_RTL8187=y"
+            echo "CONFIG_RTL_CARDS=y"
+            echo "CONFIG_RTL8192CU=y"
+            echo "CONFIG_RTL8XXXU_UNTESTED=y"
+            echo "CONFIG_WLAN_VENDOR_ZYDAS=y"
+            echo "CONFIG_USB_ZD1201=y"
+            echo "CONFIG_ZD1211RW=y"
+            echo "CONFIG_USB_NET_RNDIS_WLAN=y"
+            echo "CONFIG_USB_RTL8150=y"
+            echo "CONFIG_USB_RTL8152=y"
+            echo "CONFIG_MEDIA_SUPPORT=y"
+            echo "CONFIG_MEDIA_SDR_SUPPORT=y"
+            echo "CONFIG_MEDIA_DIGITAL_TV_SUPPORT=y"
+          } >> gki_defconfig
+
+      - name: Set IIO / PCI endpoint configfs configs
+        run: |
+          cd kernel_workspace/common/arch/arm64/configs
+          {
+            echo "CONFIG_IIO=y"
+            echo "CONFIG_IIO_CONFIGFS=y"
+            echo "CONFIG_PCI_ENDPOINT=y"
+            echo "CONFIG_PCI_ENDPOINT_CONFIGFS=y"
+          } >> gki_defconfig
+
+      - name: Apply custom kernel branding
+        working-directory: kernel_workspace/common
+        run: |
+          set -euo pipefail
+          mv scripts/setlocalversion scripts/setlocalversion.orig
+          chmod +x scripts/setlocalversion.orig
+          cat > scripts/setlocalversion << 'EOF'
+          #!/bin/sh
+          printf -- '-BLAZE-KSUNv1-STABLE'
+
+          EOF
+          chmod +x scripts/setlocalversion
+
+      - name: Disable strict defconfig verification
+        working-directory: kernel_workspace
+        run: sed -i 's/check_defconfig//' ./common/build.config.gki
+
+      - name: Disable strict GKI modules list verification
+        working-directory: kernel_workspace/common
+        run: |
+          set -euo pipefail
+          grep -rl '^MODULES_ORDER=' build.config* 2>/dev/null | xargs -r sed -i 's/^MODULES_ORDER=.*/MODULES_ORDER=/' || true
+          grep -rl '^MODULES_LIST=' build.config* 2>/dev/null | xargs -r sed -i 's/^MODULES_LIST=.*/MODULES_LIST=/' || true
+
+      - name: Build kernel
+        working-directory: kernel_workspace
+        run: |
+          set -euo pipefail
+          export KBUILD_BUILD_USER="builder"
+          export KBUILD_BUILD_HOST="ci"
+          LTO=thin BUILD_CONFIG=common/build.config.gki.aarch64 USE_CCACHE=1 CCACHE_DIR="${CCACHE_DIR}" build/build.sh -j"$(nproc)"
+
+      - name: Verify final configs
+        working-directory: kernel_workspace
+        run: |
+          set -euo pipefail
+          CFG=$(find out -name ".config" | head -n1)
+          [ -n "$CFG" ]
+          for SYM in CONFIG_NAMESPACES CONFIG_NET_NS CONFIG_PID_NS CONFIG_CGROUPS CONFIG_USER_NS CONFIG_USB_CONFIGFS_F_HID CONFIG_USB_CONFIGFS CONFIG_USB_GADGET; do
+            grep -q "^${SYM}=y$" "$CFG"
+          done
+          if [ "${{ github.event.inputs.enable_hid }}" = "true" ]; then
+            for SYM in CONFIG_USB_CONFIGFS_F_LB_SS CONFIG_USB_CONFIGFS_F_PRINTER CONFIG_USB_CONFIGFS_F_UAC1; do
+              grep -q "^${SYM}=y$" "$CFG" || echo "::warning::${SYM} did not end up enabled in the final .config"
+            done
+          fi
+          if [ "${{ github.event.inputs.enable_can }}" = "true" ]; then
+            grep -q "^CONFIG_CAN=y$" "$CFG"
+          fi
+          if [ "${{ github.event.inputs.enable_nethunter }}" = "true" ]; then
+            for SYM in CONFIG_BT_HCIBTUSB CONFIG_MAC80211 CONFIG_ATH9K_HTC CONFIG_RTL8187 CONFIG_MEDIA_SDR_SUPPORT; do
+              grep -q "^${SYM}=y$" "$CFG" || echo "::warning::${SYM} did not end up enabled in the final .config"
+            done
+          fi
+
+      - name: Locate built Image
+        working-directory: kernel_workspace
+        run: |
+          set -euo pipefail
+          IMG=$(find out -path "*dist/Image" | head -n1)
+          if [ -z "$IMG" ]; then
+            IMG=$(find out -name "Image" | head -n1)
+          fi
+          [ -n "$IMG" ]
+          echo "IMG_PATH=kernel_workspace/${IMG}" >> "$GITHUB_ENV"
+
+      - name: Package AnyKernel3
+        run: |
+          set -euo pipefail
+          git clone --depth=1 https://github.com/WildKernels/AnyKernel3.git -b gki-2.0 ak3
+          cp "${{ env.IMG_PATH }}" ak3/Image
+          cd ak3
+          zip -r9 -q "../${{ github.event.inputs.device_name }}-Blaze-android12-5.10-susfs${SUSFS_COMMIT:0:8}.zip" . -x ".git*"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ github.event.inputs.device_name }}-build
+          path: "*.zip"
+          retention-days: 14
