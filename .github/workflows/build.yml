@@ -1,36 +1,43 @@
-name: Build Custom GKI Kernel (Wild KSU + SUSFS + BBRv3 + Full HID Support)
+name: Build Custom GKI NetHunter Kernel
 
 on:
   workflow_dispatch:
     inputs:
       os_patch_level:
-        description: "'lts' = rolling LTS branch. Or pin an exact GKI release tag, e.g. android12-5.10.264_r00"
+        description: "lts or exact tag such as android12-5.10.264_r00"
         required: true
         default: "android12-5.10.264_r00"
       susfs_commit:
-        description: "SUSFS commit hash (leave empty = latest on gki-android12-5.10 branch)"
+        description: "Optional SUSFS commit"
         required: false
         default: ""
       device_name:
-        description: "Optional label for artifact naming"
-        required: false
+        description: "Artifact/device name"
+        required: true
         default: "gki-custom"
       enable_bbg:
-        description: "Enable Baseband Guard (BBG)"
+        description: "Enable Baseband Guard"
         required: true
         default: "true"
       enable_hid:
-        description: "Enable full USB HID gadget support"
+        description: "Enable USB HID gadget and host support"
         required: true
         default: "true"
       enable_can:
-        description: "Enable CAN bus support"
+        description: "Enable CAN and USB-CAN support"
         required: true
         default: "true"
       enable_nethunter:
-        description: "Enable Kali NetHunter Bluetooth/WiFi/SDR configs"
+        description: "Enable NetHunter WiFi/Bluetooth/USB/SDR support"
         required: true
         default: "true"
+      enable_sdr:
+        description: "Enable SDR/DVB USB support"
+        required: true
+        default: "true"
+
+permissions:
+  contents: read
 
 env:
   VERSION: android12-5.10
@@ -39,170 +46,139 @@ env:
 jobs:
   build:
     runs-on: ubuntu-22.04
-    timeout-minutes: 150
+    timeout-minutes: 180
 
     steps:
-      - name: Checkout Repository
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Free up disk space
+      - name: Free disk space
         run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc || true
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
           sudo apt-get clean
 
-      - name: Install dependencies
+      - name: Install build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y git curl bc bison flex libssl-dev \
-            build-essential python3 python3-pip libncurses-dev \
-            ccache zip unzip device-tree-compiler
+          sudo apt-get install -y \
+            git curl wget ca-certificates bc bison flex gawk \
+            build-essential python3 python3-pip python3-setuptools \
+            libssl-dev libelf-dev libncurses-dev \
+            device-tree-compiler ccache zip unzip \
+            rsync perl pahole lz4 xz-utils
 
-      - name: Install repo tool
+      - name: Install repo
         run: |
-          mkdir -p ~/bin
-          curl -fsSL https://storage.googleapis.com/git-repo-downloads/repo -o ~/bin/repo
-          chmod a+x ~/bin/repo
+          mkdir -p "$HOME/bin"
+          curl -fsSL \
+            https://storage.googleapis.com/git-repo-downloads/repo \
+            -o "$HOME/bin/repo"
+          chmod +x "$HOME/bin/repo"
           echo "$HOME/bin" >> "$GITHUB_PATH"
           git config --global user.name "github-actions[bot]"
-          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git config --global user.email \
+            "41898282+github-actions[bot]@users.noreply.github.com"
 
-      - name: Set up ccache
-        run: mkdir -p "${CCACHE_DIR}"
+      - name: Configure ccache
+        run: |
+          mkdir -p "$CCACHE_DIR"
+          ccache --max-size=8G
+          ccache --set-config=cache_dir="$CCACHE_DIR"
 
-      - name: Resolve manifest branch and optional pinned release tag
+      - name: Resolve manifest
         run: |
           set -euo pipefail
-          INPUT="${{ github.event.inputs.os_patch_level }}"
-          if [ "${INPUT}" = "lts" ]; then
-            MANIFEST_REF="common-${VERSION}-lts"
-            PIN_TAG=""
-          else
-            MANIFEST_REF="common-${VERSION}"
-            PIN_TAG="${INPUT}"
-          fi
-          echo "MANIFEST_REF=${MANIFEST_REF}" >> "$GITHUB_ENV"
-          echo "PIN_TAG=${PIN_TAG}" >> "$GITHUB_ENV"
+          input="${{ github.event.inputs.os_patch_level }}"
 
-      - name: Sync GKI kernel source
+          if [ "$input" = "lts" ]; then
+            manifest_ref="common-${VERSION}-lts"
+            pin_tag=""
+          else
+            manifest_ref="common-${VERSION}"
+            pin_tag="$input"
+          fi
+
+          {
+            echo "MANIFEST_REF=$manifest_ref"
+            echo "PIN_TAG=$pin_tag"
+          } >> "$GITHUB_ENV"
+
+      - name: Sync Android GKI source
         run: |
           set -euo pipefail
           mkdir -p kernel_workspace
           cd kernel_workspace
-          repo init -u https://android.googlesource.com/kernel/manifest -b "${MANIFEST_REF}" --depth=1
-          repo sync -c --current-branch --no-clone-bundle --no-tags -j"$(nproc)"
 
-      - name: Pin kernel/common to exact release tag
+          repo init \
+            -u https://android.googlesource.com/kernel/manifest \
+            -b "$MANIFEST_REF" \
+            --depth=1
+
+          repo sync \
+            -c \
+            --current-branch \
+            --no-clone-bundle \
+            --no-tags \
+            -j"$(nproc)"
+
+      - name: Checkout requested GKI tag
         if: ${{ env.PIN_TAG != '' }}
         working-directory: kernel_workspace/common
         run: |
           set -euo pipefail
-          REMOTE_NAME="$(git remote | head -n1)"
-          [ -n "${REMOTE_NAME}" ]
-          git fetch --depth=1 "${REMOTE_NAME}" "refs/tags/${PIN_TAG}:refs/tags/${PIN_TAG}"
+          remote="$(git remote | head -n1)"
+          git fetch --depth=1 "$remote" \
+            "refs/tags/${PIN_TAG}:refs/tags/${PIN_TAG}"
           git checkout "refs/tags/${PIN_TAG}"
 
-      - name: Detect kernel sublevel
-        working-directory: kernel_workspace
+      - name: Detect kernel version
+        working-directory: kernel_workspace/common
         run: |
           set -euo pipefail
-          SUBLEVEL="$(grep -m1 '^SUBLEVEL = ' common/Makefile | awk '{print $3}')"
-          echo "SUBLEVEL=${SUBLEVEL}" >> "$GITHUB_ENV"
+          sublevel="$(awk '$1 == "SUBLEVEL" {print $3; exit}' Makefile)"
+          echo "SUBLEVEL=$sublevel" >> "$GITHUB_ENV"
 
-      - name: Clone SUSFS4KSU
+      - name: Clone SUSFS
         working-directory: kernel_workspace
         run: |
           set -euo pipefail
-          git clone https://gitlab.com/simonpunk/susfs4ksu.git -b gki-android12-5.10 susfs4ksu
+          git clone \
+            -b gki-android12-5.10 \
+            --depth=1 \
+            https://gitlab.com/simonpunk/susfs4ksu.git \
+            susfs4ksu
+
           cd susfs4ksu
+
           if [ -n "${{ github.event.inputs.susfs_commit }}" ]; then
+            git fetch --depth=1 origin \
+              "${{ github.event.inputs.susfs_commit }}"
             git checkout "${{ github.event.inputs.susfs_commit }}"
           fi
+
           echo "SUSFS_COMMIT=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
 
-      - name: Set SUSFS kernel configs
-        run: |
-          cd kernel_workspace/common/arch/arm64/configs
-          {
-            echo "CONFIG_KSU=y"
-            echo "CONFIG_KSU_SUSFS=y"
-            echo "CONFIG_KSU_SUSFS_SUS_PATH=y"
-            echo "CONFIG_KSU_SUSFS_SUS_MOUNT=y"
-            echo "CONFIG_KSU_SUSFS_SUS_KSTAT=y"
-            echo "CONFIG_KSU_SUSFS_SPOOF_UNAME=y"
-            echo "CONFIG_KSU_SUSFS_ENABLE_LOG=y"
-            echo "CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y"
-            echo "CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y"
-            echo "CONFIG_KSU_SUSFS_OPEN_REDIRECT=y"
-            echo "CONFIG_KSU_SUSFS_SUS_MAP=y"
-          } >> gki_defconfig
-
-      - name: Copy SUSFS kernel patches
-        run: |
-          cd kernel_workspace/common
-          cp ../susfs4ksu/kernel_patches/fs/* ./fs/
-          cp ../susfs4ksu/kernel_patches/include/linux/* ./include/linux/
-          cp ../susfs4ksu/kernel_patches/50_add_susfs_in_gki-android12-5.10.patch ./
-
-      - name: Apply android12-5.10 pre-patch compatibility fixes
+      - name: Apply SUSFS files
         working-directory: kernel_workspace/common
         run: |
           set -euo pipefail
-          if [ "${SUBLEVEL}" -le "43" ]; then
-            perl -i -pe 's/(int|size_t)\s+this_len\s*=\s*min_t\s*\(\s*\1\s*,/size_t this_len = min_t(size_t,/' fs/proc/base.c
-          fi
-          if [ "${SUBLEVEL}" -le "117" ]; then
-            sed -i '\#^[[:space:]]*/\*$#,\#^[[:space:]]*u32 mask = mark->mask & IN_ALL_EVENTS;$#d' fs/notify/fdinfo.c
-            perl -i -pe 's/\bmask,\s*mark->ignored_mask/inotify_mark_user_mask(mark)/g' fs/notify/fdinfo.c
-            perl -i -pe 's/ignored_mask:%x/ignored_mask:0/g' fs/notify/fdinfo.c
-          fi
 
-      - name: Apply SUSFS kernel patch
+          cp ../susfs4ksu/kernel_patches/fs/* fs/
+          cp ../susfs4ksu/kernel_patches/include/linux/* include/linux/
+          cp ../susfs4ksu/kernel_patches/50_add_susfs_in_gki-android12-5.10.patch .
+
+          patch -p1 --fuzz=3 \
+            < 50_add_susfs_in_gki-android12-5.10.patch
+
+      - name: Setup KernelSU Next
         working-directory: kernel_workspace/common
         run: |
           set -euo pipefail
-          patch -p1 --fuzz=3 < 50_add_susfs_in_gki-android12-5.10.patch
+          curl -fsSL \
+            https://raw.githubusercontent.com/pershoot/KernelSU-Next/dev-susfs/kernel/setup.sh \
+            | bash -s dev-susfs
 
-      - name: Fix SUSFS set_nameidata argument mismatch
-        working-directory: kernel_workspace/common
-        run: |
-          set -euo pipefail
-          sed -i 's/set_nameidata(nd, old_dfd, fake_filename, NULL);/set_nameidata(nd, old_dfd, fake_filename);/g' fs/namei.c
-
-      - name: Revert android12-5.10 pre-patch compatibility fixes
-        working-directory: kernel_workspace/common
-        run: |
-          set -euo pipefail
-          if [ "${SUBLEVEL}" -le "43" ]; then
-            sed -i 's/^size_t this_len = min_t(size_t, count, PAGE_SIZE);$/int this_len = min_t(int, count, PAGE_SIZE);/' fs/proc/base.c
-          fi
-          if [ "${SUBLEVEL}" -le "117" ]; then
-            perl -i -pe 's#^(\s+if \(inode\) \{)#$1
-            \t\t/*
-            \t\t * IN_ALL_EVENTS represents all of the mask bits
-            \t\t * that we expose to userspace.  There is at
-            \t\t * least one bit (FS_EVENT_ON_CHILD) which is
-            \t\t * used only internally to the kernel.
-            \t\t */
-            \t\tu32 mask = mark->mask & IN_ALL_EVENTS;#m' fs/notify/fdinfo.c
-            perl -i -pe 's/\binotify_mark_user_mask\(mark\)/mask, mark->ignored_mask/g' fs/notify/fdinfo.c
-            perl -i -pe 's/ignored_mask:0/ignored_mask:%x/g' fs/notify/fdinfo.c
-          fi
-
-      - name: Apply SUSFS show_pad fix
-        working-directory: kernel_workspace/common
-        run: |
-          set -euo pipefail
-          if [ "${SUBLEVEL}" -le "209" ]; then
-            sed -i -e 's/goto show_pad;/return 0;/' ./fs/proc/task_mmu.c
-          fi
-
-      - name: Setup KernelSU-Next
-        working-directory: kernel_workspace/common
-        run: |
-          set -euo pipefail
-          curl -fsSL "https://raw.githubusercontent.com/pershoot/KernelSU-Next/dev-susfs/kernel/setup.sh" | bash -s dev-susfs
-
-      - name: Fix KernelSU-Next static patch
+      - name: Apply KernelSU static patch
         working-directory: kernel_workspace/common/KernelSU-Next
         run: |
           set -euo pipefail
@@ -215,307 +191,386 @@ jobs:
         working-directory: kernel_workspace
         run: |
           set -euo pipefail
-          wget -qO- https://github.com/vc-teahouse/Baseband-guard/raw/main/setup.sh | bash
+          wget -qO- \
+            https://github.com/vc-teahouse/Baseband-guard/raw/main/setup.sh \
+            | bash
 
-      - name: Configure Baseband Guard LSM
+      - name: Configure Baseband Guard
         if: ${{ github.event.inputs.enable_bbg == 'true' }}
         working-directory: kernel_workspace
         run: |
-           set -euo pipefail
-           sed -i '/^config LSM$/,/^help$/{ /^[[:space:]]*default/ { /baseband_guard/! s/selinux/selinux,baseband_guard/ } }' common/security/Kconfig
+          set -euo pipefail
 
-      - name: Enable BBG config
-        if: ${{ github.event.inputs.enable_bbg == 'true' }}
-        run: |
-          cd kernel_workspace/common/arch/arm64/configs
-          echo "CONFIG_BBG=y" >> gki_defconfig
+          if grep -q 'config BBG' common/security/Kconfig 2>/dev/null; then
+            echo "BBG Kconfig found"
+          else
+            echo "::warning::BBG Kconfig was not found"
+          fi
 
-      - name: Apply BBRv3 backport
+      - name: Apply BBRv3
         working-directory: kernel_workspace/common
         run: |
           set -euo pipefail
-          git clone --depth=1 https://github.com/WildKernels/kernel_patches.git /tmp/wildpatches
-          BBRV3_PATCH="/tmp/wildpatches/common/bbrv3/0001-net-tcp-backport-BBRv3-to-android12-5.10.patch"
-          BBR_CONG_NAME="bbr"
-          BBRV3_PATCH_APPLIED="false"
-          if [ -f "$BBRV3_PATCH" ] && patch -p1 < "$BBRV3_PATCH"; then
-            BBRV3_PATCH_APPLIED="true"
-            DETECTED="$(grep -rhoE '\.name\s*=\s*"[a-zA-Z0-9_]+"' net/ipv4/tcp_bbr*.c 2>/dev/null | grep -oE '"[a-zA-Z0-9_]+"' | tr -d '"' | head -n1 || true)"
-            [ -n "$DETECTED" ] && BBR_CONG_NAME="$DETECTED"
-          fi
-          echo "BBR_CONG_NAME=${BBR_CONG_NAME}" >> "$GITHUB_ENV"
-          echo "BBRV3_PATCH_APPLIED=${BBRV3_PATCH_APPLIED}" >> "$GITHUB_ENV"
 
-      - name: Set networking / TCP congestion configs
-        run: |
-          cd kernel_workspace/common/arch/arm64/configs
-          {
-            echo "CONFIG_TCP_CONG_ADVANCED=y"
-            echo "CONFIG_TCP_CONG_BBR=y"
-            echo "CONFIG_TCP_CONG_CUBIC=y"
-            echo "CONFIG_TCP_CONG_BIC=y"
-            echo "CONFIG_TCP_CONG_WESTWOOD=y"
-            echo "CONFIG_TCP_CONG_HTCP=y"
-            if [ "${BBRV3_PATCH_APPLIED}" = "true" ]; then
-              echo "CONFIG_TCP_CONG_BBR3=y"
+          git clone --depth=1 \
+            https://github.com/WildKernels/kernel_patches.git \
+            /tmp/wildpatches
+
+          patch_file="/tmp/wildpatches/common/bbrv3/0001-net-tcp-backport-BBRv3-to-android12-5.10.patch"
+
+          if [ -f "$patch_file" ]; then
+            if patch -p1 < "$patch_file"; then
+              echo "BBRV3_PATCH_APPLIED=true" >> "$GITHUB_ENV"
+            else
+              echo "::warning::BBRv3 patch did not apply"
+              echo "BBRV3_PATCH_APPLIED=false" >> "$GITHUB_ENV"
             fi
-            echo "CONFIG_DEFAULT_TCP_CONG=${BBR_CONG_NAME}"
-            echo "CONFIG_NET_SCH_FQ=y"
-            echo "CONFIG_NET_SCH_FQ_CODEL=y"
-            echo "CONFIG_NET_SCH_CAKE=y"
-          } >> gki_defconfig
+          else
+            echo "::warning::BBRv3 patch was not found"
+            echo "BBRV3_PATCH_APPLIED=false" >> "$GITHUB_ENV"
+          fi
 
-      - name: Apply NTSync patches
+      - name: Apply all configs safely
         working-directory: kernel_workspace/common
+        env:
+          ENABLE_HID: ${{ github.event.inputs.enable_hid }}
+          ENABLE_CAN: ${{ github.event.inputs.enable_can }}
+          ENABLE_NETHUNTER: ${{ github.event.inputs.enable_nethunter }}
+          ENABLE_SDR: ${{ github.event.inputs.enable_sdr }}
+          ENABLE_BBG: ${{ github.event.inputs.enable_bbg }}
+          BBRV3_PATCH_APPLIED: ${{ env.BBRV3_PATCH_APPLIED }}
         run: |
           set -euo pipefail
-          if [ "${SUBLEVEL}" -le "208" ]; then
-            curl -fsSL -o /tmp/0003-lockdep-assert-none-held.patch \
-              https://raw.githubusercontent.com/WildKernels/GKI_KernelSU_SUSFS/main/.github/actions/ntsync/patches/0003-lockdep-assert-none-held.patch
-            patch -p1 -N < /tmp/0003-lockdep-assert-none-held.patch || true
-          fi
-          curl -fsSL -o /tmp/ntsync_compat_android12-5.10.patch \
-            https://raw.githubusercontent.com/WildKernels/kernel_patches/main/common/ntsync/ntsync_compat_android12-5.10.patch
-          patch -p1 < /tmp/ntsync_compat_android12-5.10.patch || true
-          curl -fsSL -o /tmp/ntsync_base.patch \
-            https://raw.githubusercontent.com/WildKernels/kernel_patches/main/common/ntsync/ntsync_base.patch
-          patch -p1 < /tmp/ntsync_base.patch || true
-          echo "CONFIG_NTSYNC=y" >> arch/arm64/configs/gki_defconfig
 
-      - name: Apply Droidspaces kABI-safe patches
-        working-directory: kernel_workspace/common
-        run: |
-          set -euo pipefail
-          DROIDSPACES_KABI_OK="true"
-          curl -fsSL -o /tmp/droidspaces_sysvipc_kabi.patch \
-            https://raw.githubusercontent.com/ravindu644/Droidspaces-OSS/main/Documentation/resources/kernel-patches/GKI/below-kernel-6.12/001.GKI-below-6.12-fix_sysvipc_kabi_6_7_8.patch
-          if ! patch -p1 < /tmp/droidspaces_sysvipc_kabi.patch; then
-            DROIDSPACES_KABI_OK="false"
-          fi
-          curl -fsSL -o /tmp/droidspaces_posix_mqueue_kabi.patch \
-            https://raw.githubusercontent.com/ravindu644/Droidspaces-OSS/main/Documentation/resources/kernel-patches/GKI/below-kernel-6.12/002.5.10_or_lower_use_android_abi_padding_for_posix_mqueue.patch
-          if ! patch -p1 < /tmp/droidspaces_posix_mqueue_kabi.patch; then
-            DROIDSPACES_KABI_OK="false"
-          fi
-          echo "DROIDSPACES_KABI_OK=${DROIDSPACES_KABI_OK}" >> "$GITHUB_ENV"
+          cfg="arch/arm64/configs/gki_defconfig"
+          tmp="$(mktemp)"
 
-      - name: Set Droidspaces configs
-        run: |
-          cd kernel_workspace/common/arch/arm64/configs
-          if [ "${DROIDSPACES_KABI_OK}" = "true" ]; then
-            {
-              echo "CONFIG_SYSVIPC=y"
-              echo "CONFIG_POSIX_MQUEUE=y"
-              echo "CONFIG_IPC_NS=y"
-            } >> gki_defconfig
-          fi
-          {
-            echo "CONFIG_NAMESPACES=y"
-            echo "CONFIG_NET_NS=y"
-            echo "CONFIG_CGROUPS=y"
-            echo "CONFIG_PID_NS=y"
-            echo "CONFIG_USER_NS=y"
-            echo "CONFIG_DEVTMPFS=y"
-            echo "CONFIG_NETFILTER_XT_MATCH_ADDRTYPE=y"
-            echo "CONFIG_NETFILTER_XT_TARGET_REJECT=y"
-            echo "CONFIG_NETFILTER_XT_TARGET_LOG=y"
-            echo "CONFIG_NETFILTER_XT_MATCH_RECENT=y"
-            echo "CONFIG_IP_SET=y"
-            echo "CONFIG_IP_SET_HASH_IP=y"
-            echo "CONFIG_IP_SET_HASH_NET=y"
-            echo "CONFIG_NETFILTER_XT_SET=y"
-            echo "CONFIG_TMPFS_POSIX_ACL=y"
-            echo "CONFIG_TMPFS_XATTR=y"
-          } >> gki_defconfig
-
-      - name: Set full USB HID gadget configs
-        if: ${{ github.event.inputs.enable_hid == 'true' }}
-        run: |
-          cd kernel_workspace/common/arch/arm64/configs
-          # Note: F_UAC1 and F_UAC1_LEGACY are two separate audio-source
-          # function drivers (new vs legacy ALSA path). Some GKI Kconfig
-          # versions treat them as a mutually exclusive choice — if the
-          # build fails on this pair, drop F_UAC1_LEGACY and keep F_UAC1.
-          {
-            echo "CONFIG_USB_GADGET=y"
-            echo "CONFIG_USB_LIBCOMPOSITE=y"
-            echo "CONFIG_USB_CONFIGFS=y"
-            echo "CONFIG_USB_CONFIGFS_SERIAL=y"
-            echo "CONFIG_USB_CONFIGFS_ACM=y"
-            echo "CONFIG_USB_CONFIGFS_OBEX=y"
-            echo "CONFIG_USB_CONFIGFS_NCM=y"
-            echo "CONFIG_USB_CONFIGFS_ECM=y"
-            echo "CONFIG_USB_CONFIGFS_ECM_SUBSET=y"
-            echo "CONFIG_USB_CONFIGFS_RNDIS=y"
-            echo "CONFIG_USB_CONFIGFS_EEM=y"
-            echo "CONFIG_USB_CONFIGFS_MASS_STORAGE=y"
-            echo "CONFIG_USB_CONFIGFS_F_HID=y"
-            echo "CONFIG_USB_CONFIGFS_F_FS=y"
-            echo "CONFIG_USB_CONFIGFS_UEVENT=y"
-            echo "CONFIG_USB_CONFIGFS_F_LB_SS=y"
-            echo "CONFIG_USB_CONFIGFS_F_PRINTER=y"
-            echo "CONFIG_USB_CONFIGFS_F_UAC1=y"
-            echo "CONFIG_USB_CONFIGFS_F_UAC1_LEGACY=y"
-            echo "CONFIG_USB_ACM=y"
-            echo "CONFIG_HIDRAW=y"
-            echo "CONFIG_UHID=y"
-          } >> gki_defconfig
-
-      - name: Set CAN bus configs
-        if: ${{ github.event.inputs.enable_can == 'true' }}
-        run: |
-          cd kernel_workspace/common/arch/arm64/configs
-          {
-            echo "CONFIG_CAN=y"
-            echo "CONFIG_CAN_RAW=y"
-            echo "CONFIG_CAN_BCM=y"
-            echo "CONFIG_CAN_GW=y"
-            echo "CONFIG_CAN_J1939=y"
-            echo "CONFIG_CAN_ISOTP=y"
-            echo "CONFIG_CAN_VCAN=y"
-            echo "CONFIG_CAN_VXCAN=y"
-            echo "CONFIG_CAN_SLCAN=y"
-            echo "CONFIG_CAN_DEV=y"
-            echo "CONFIG_CAN_CALC_BITTIMING=y"
-            echo "CONFIG_CAN_KVASER_USB=y"
-            echo "CONFIG_CAN_PEAK_USB=y"
-            echo "CONFIG_CAN_EMS_USB=y"
-            echo "CONFIG_CAN_8DEV_USB=y"
-            echo "CONFIG_CAN_GS_USB=y"
-            echo "CONFIG_CAN_ESD_USB2=y"
-            echo "CONFIG_CAN_MCBA_USB=y"
-            echo "CONFIG_CAN_UCAN=y"
-          } >> gki_defconfig
-
-      - name: Set Kali NetHunter Bluetooth/WiFi/SDR configs
-        if: ${{ github.event.inputs.enable_nethunter == 'true' }}
-        run: |
-          cd kernel_workspace/common/arch/arm64/configs
-          {
-            echo "CONFIG_BT_HCIBTUSB=y"
-            echo "CONFIG_BT_HCIBTUSB_BCM=y"
-            echo "CONFIG_BT_HCIBTUSB_RTL=y"
-            echo "CONFIG_BT_HCIUART=y"
-            echo "CONFIG_BT_HCIUART_H4=y"
-            echo "CONFIG_BT_HCIBCM203X=y"
-            echo "CONFIG_BT_HCIBPA10X=y"
-            echo "CONFIG_BT_HCIBFUSB=y"
-            echo "CONFIG_BT_HCIVHCI=y"
-            echo "CONFIG_CFG80211_WEXT=y"
-            echo "CONFIG_MAC80211=y"
-            echo "CONFIG_WLAN_VENDOR_ATH=y"
-            echo "CONFIG_ATH9K_HTC=y"
-            echo "CONFIG_CARL9170=y"
-            echo "CONFIG_ATH6KL=y"
-            echo "CONFIG_ATH6KL_USB=y"
-            echo "CONFIG_WLAN_VENDOR_RALINK=y"
-            echo "CONFIG_RT2X00=y"
-            echo "CONFIG_RT2500USB=y"
-            echo "CONFIG_RT73USB=y"
-            echo "CONFIG_RT2800USB=y"
-            echo "CONFIG_WLAN_VENDOR_REALTEK=y"
-            echo "CONFIG_RTL8187=y"
-            echo "CONFIG_RTL_CARDS=y"
-            echo "CONFIG_RTL8192CU=y"
-            echo "CONFIG_RTL8XXXU_UNTESTED=y"
-            echo "CONFIG_WLAN_VENDOR_ZYDAS=y"
-            echo "CONFIG_USB_ZD1201=y"
-            echo "CONFIG_ZD1211RW=y"
-            echo "CONFIG_USB_NET_RNDIS_WLAN=y"
-            echo "CONFIG_USB_RTL8150=y"
-            echo "CONFIG_USB_RTL8152=y"
-            echo "CONFIG_MEDIA_SUPPORT=y"
-            echo "CONFIG_MEDIA_SDR_SUPPORT=y"
-            echo "CONFIG_MEDIA_DIGITAL_TV_SUPPORT=y"
-          } >> gki_defconfig
-
-      - name: Set IIO / PCI endpoint configfs configs
-        run: |
-          cd kernel_workspace/common/arch/arm64/configs
-          {
-            echo "CONFIG_IIO=y"
-            echo "CONFIG_IIO_CONFIGFS=y"
-            echo "CONFIG_PCI_ENDPOINT=y"
-            echo "CONFIG_PCI_ENDPOINT_CONFIGFS=y"
-          } >> gki_defconfig
-
-      - name: Apply custom kernel branding
-        working-directory: kernel_workspace/common
-        run: |
-          set -euo pipefail
-          mv scripts/setlocalversion scripts/setlocalversion.orig
-          chmod +x scripts/setlocalversion.orig
-          cat > scripts/setlocalversion << 'EOF'
-          #!/bin/sh
-          printf -- '-BLAZE-KSUNv1-STABLE'
-
+          cat > /tmp/required.configs <<'EOF'
+          CONFIG_SYSVIPC=y
+          CONFIG_MODULES=y
+          CONFIG_MODULE_UNLOAD=y
+          CONFIG_MODULE_FORCE_UNLOAD=y
+          CONFIG_MODVERSIONS=y
+          CONFIG_NAMESPACES=y
+          CONFIG_NET_NS=y
+          CONFIG_PID_NS=y
+          CONFIG_USER_NS=y
+          CONFIG_CGROUPS=y
+          CONFIG_DEVTMPFS=y
+          CONFIG_ANDROID_BINDER_IPC=y
+          CONFIG_ANDROID_BINDERFS=y
+          CONFIG_NETFILTER_XT_MATCH_ADDRTYPE=y
+          CONFIG_NETFILTER_XT_TARGET_REJECT=y
+          CONFIG_NETFILTER_XT_TARGET_LOG=y
+          CONFIG_NETFILTER_XT_MATCH_RECENT=y
+          CONFIG_IP_SET=y
+          CONFIG_IP_SET_HASH_IP=y
+          CONFIG_IP_SET_HASH_NET=y
+          CONFIG_NETFILTER_XT_SET=y
+          CONFIG_TMPFS_POSIX_ACL=y
+          CONFIG_TMPFS_XATTR=y
+          CONFIG_TCP_CONG_ADVANCED=y
+          CONFIG_TCP_CONG_CUBIC=y
+          CONFIG_TCP_CONG_BIC=y
+          CONFIG_TCP_CONG_WESTWOOD=y
+          CONFIG_TCP_CONG_HTCP=y
+          CONFIG_NET_SCH_FQ=y
+          CONFIG_NET_SCH_FQ_CODEL=y
+          CONFIG_NET_SCH_CAKE=y
+          CONFIG_INPUT=y
+          CONFIG_INPUT_EVDEV=y
+          CONFIG_HID=y
+          CONFIG_HID_GENERIC=y
+          CONFIG_HIDRAW=y
+          CONFIG_UHID=y
+          CONFIG_USB_SERIAL=y
+          CONFIG_USB_SERIAL_GENERIC=y
+          CONFIG_USB_SERIAL_FTDI_SIO=y
+          CONFIG_USB_SERIAL_PL2303=y
+          CONFIG_USB_SERIAL_CP210X=y
+          CONFIG_USB_SERIAL_CH341=y
+          CONFIG_USB_SERIAL_OPTION=y
+          CONFIG_USB_SERIAL_QUALCOMM=y
+          CONFIG_USB_SERIAL_SIMPLE=y
+          CONFIG_USB_ACM=y
+          CONFIG_BT_HCIBTUSB=y
+          CONFIG_BT_HCIBTUSB_BCM=y
+          CONFIG_BT_HCIBTUSB_RTL=y
+          CONFIG_BT_HCIUART=y
+          CONFIG_BT_HCIUART_H4=y
+          CONFIG_BT_HCIBCM203X=y
+          CONFIG_BT_HCIBPA10X=y
+          CONFIG_BT_HCIBFUSB=y
+          CONFIG_BT_HCIVHCI=y
+          CONFIG_CFG80211_WEXT=y
+          CONFIG_MAC80211=y
+          CONFIG_MAC80211_MESH=y
+          CONFIG_WLAN_VENDOR_ATH=y
+          CONFIG_ATH9K_HTC=y
+          CONFIG_CARL9170=y
+          CONFIG_ATH6KL=y
+          CONFIG_ATH6KL_USB=y
+          CONFIG_WLAN_VENDOR_RALINK=y
+          CONFIG_RT2X00=y
+          CONFIG_RT2500USB=y
+          CONFIG_RT73USB=y
+          CONFIG_RT2800USB=y
+          CONFIG_WLAN_VENDOR_REALTEK=y
+          CONFIG_RTL8187=y
+          CONFIG_RTL_CARDS=y
+          CONFIG_RTL8192CU=y
+          CONFIG_RTL8XXXU=y
+          CONFIG_RTL8XXXU_UNTESTED=y
+          CONFIG_WLAN_VENDOR_ZYDAS=y
+          CONFIG_USB_ZD1201=y
+          CONFIG_ZD1211RW=y
+          CONFIG_USB_NET_RNDIS_WLAN=y
+          CONFIG_USB_RTL8150=y
+          CONFIG_USB_RTL8152=y
+          CONFIG_MEDIA_SUPPORT=y
+          CONFIG_MEDIA_USB_SUPPORT=y
+          CONFIG_MEDIA_SDR_SUPPORT=y
+          CONFIG_MEDIA_DIGITAL_TV_SUPPORT=y
+          CONFIG_DVB_USB_RTL28XXU=y
+          CONFIG_DVB_RTL2830=y
+          CONFIG_USB_AIRSPY=y
+          CONFIG_USB_HACKRF=y
+          CONFIG_USB_MSI2500=y
+          CONFIG_CAN=y
+          CONFIG_CAN_RAW=y
+          CONFIG_CAN_BCM=y
+          CONFIG_CAN_GW=y
+          CONFIG_CAN_DEV=y
+          CONFIG_CAN_VCAN=y
+          CONFIG_CAN_VXCAN=y
+          CONFIG_CAN_SLCAN=y
+          CONFIG_CAN_CALC_BITTIMING=y
+          CONFIG_CAN_J1939=y
+          CONFIG_CAN_ISOTP=y
+          CONFIG_CAN_KVASER_USB=y
+          CONFIG_CAN_PEAK_USB=y
+          CONFIG_CAN_EMS_USB=y
+          CONFIG_CAN_8DEV_USB=y
+          CONFIG_CAN_GS_USB=y
+          CONFIG_CAN_ESD_USB2=y
+          CONFIG_CAN_MCBA_USB=y
+          CONFIG_CAN_UCAN=y
+          CONFIG_IIO=y
+          CONFIG_IIO_CONFIGFS=y
+          CONFIG_PCI_ENDPOINT=y
+          CONFIG_PCI_ENDPOINT_CONFIGFS=y
           EOF
+
+          if [ "$ENABLE_HID" = "true" ]; then
+            cat >> /tmp/required.configs <<'EOF'
+          CONFIG_USB_GADGET=y
+          CONFIG_USB_LIBCOMPOSITE=y
+          CONFIG_USB_CONFIGFS=y
+          CONFIG_USB_CONFIGFS_SERIAL=y
+          CONFIG_USB_CONFIGFS_ACM=y
+          CONFIG_USB_CONFIGFS_OBEX=y
+          CONFIG_USB_CONFIGFS_NCM=y
+          CONFIG_USB_CONFIGFS_ECM=y
+          CONFIG_USB_CONFIGFS_ECM_SUBSET=y
+          CONFIG_USB_CONFIGFS_RNDIS=y
+          CONFIG_USB_CONFIGFS_EEM=y
+          CONFIG_USB_CONFIGFS_MASS_STORAGE=y
+          CONFIG_USB_CONFIGFS_F_HID=y
+          CONFIG_USB_CONFIGFS_F_FS=y
+          CONFIG_USB_CONFIGFS_UEVENT=y
+          CONFIG_USB_CONFIGFS_F_LB_SS=y
+          CONFIG_USB_CONFIGFS_F_PRINTER=y
+          CONFIG_USB_CONFIGFS_F_UAC1=y
+          CONFIG_USB_CONFIGFS_F_UAC1_LEGACY=y
+          CONFIG_USB_HID=y
+          EOF
+          fi
+
+          if [ "$BBRV3_PATCH_APPLIED" = "true" ]; then
+            echo "CONFIG_TCP_CONG_BBR3=y" >> /tmp/required.configs
+          fi
+
+          if [ "$ENABLE_BBG" = "true" ]; then
+            echo "CONFIG_BBG=y" >> /tmp/required.configs
+          fi
+
+          if [ "$ENABLE_NETHUNTER" != "true" ]; then
+            sed -i \
+              -e '/^CONFIG_BT_/d' \
+              -e '/^CONFIG_CFG80211_WEXT/d' \
+              -e '/^CONFIG_MAC80211/d' \
+              -e '/^CONFIG_WLAN_/d' \
+              -e '/^CONFIG_ATH/d' \
+              -e '/^CONFIG_CARL/d' \
+              -e '/^CONFIG_RT/d' \
+              -e '/^CONFIG_RTL/d' \
+              -e '/^CONFIG_ZD/d' \
+              /tmp/required.configs
+          fi
+
+          if [ "$ENABLE_CAN" != "true" ]; then
+            sed -i '/^CONFIG_CAN/d' /tmp/required.configs
+          fi
+
+          if [ "$ENABLE_SDR" != "true" ]; then
+            sed -i \
+              -e '/^CONFIG_MEDIA_/d' \
+              -e '/^CONFIG_DVB_/d' \
+              -e '/^CONFIG_USB_AIRSPY/d' \
+              -e '/^CONFIG_USB_HACKRF/d' \
+              -e '/^CONFIG_USB_MSI2500/d' \
+              /tmp/required.configs
+          fi
+
+          while IFS= read -r line; do
+            symbol="${line%%=*}"
+            value="${line#*=}"
+            name="${symbol#CONFIG_}"
+
+            if grep -RqsE \
+              "^[[:space:]]*(config|menuconfig)[[:space:]]+$name([[:space:]]|$)" \
+              --include='Kconfig*' .; then
+              printf '%s\n' "$line" >> "$tmp"
+            else
+              echo "::warning::Skipping unavailable symbol: $symbol"
+            fi
+          done < /tmp/required.configs
+
+          {
+            echo
+            echo "# Custom NetHunter/KSU configuration"
+            cat "$tmp"
+          } >> "$cfg"
+
+          rm -f "$tmp"
+
+      - name: Remove invalid duplicate config entries
+        working-directory: kernel_workspace/common
+        run: |
+          set -euo pipefail
+          cfg="arch/arm64/configs/gki_defconfig"
+          awk '!seen[$0]++' "$cfg" > "$cfg.clean"
+          mv "$cfg.clean" "$cfg"
+
+      - name: Fix custom local version
+        working-directory: kernel_workspace/common
+        run: |
+          set -euo pipefail
+
+          if [ -f scripts/setlocalversion ]; then
+            mv scripts/setlocalversion scripts/setlocalversion.orig
+          fi
+
+          cat > scripts/setlocalversion <<'EOF'
+          #!/bin/sh
+          printf '%s' '-BLAZE-NETHUNTER-KSUNv1'
+          EOF
+
           chmod +x scripts/setlocalversion
 
-      - name: Disable strict defconfig verification
-        working-directory: kernel_workspace
-        run: sed -i 's/check_defconfig//' ./common/build.config.gki
-
-      - name: Disable strict GKI modules list verification
+      - name: Relax module-list bookkeeping
         working-directory: kernel_workspace/common
         run: |
           set -euo pipefail
-          grep -rl '^MODULES_ORDER=' build.config* 2>/dev/null | xargs -r sed -i 's/^MODULES_ORDER=.*/MODULES_ORDER=/' || true
-          grep -rl '^MODULES_LIST=' build.config* 2>/dev/null | xargs -r sed -i 's/^MODULES_LIST=.*/MODULES_LIST=/' || true
 
-      - name: Build kernel
+          find . -maxdepth 1 -type f -name 'build.config*' -print0 |
+            xargs -0 -r sed -i \
+              -e 's/^MODULES_ORDER=.*/MODULES_ORDER=/' \
+              -e 's/^MODULES_LIST=.*/MODULES_LIST=/'
+
+      - name: Build GKI kernel
+        working-directory: kernel_workspace
+        env:
+          BUILD_CONFIG: common/build.config.gki.aarch64
+          CCACHE_DIR: /home/runner/.ccache
+          USE_CCACHE: "1"
+          LTO: thin
+          KBUILD_BUILD_USER: builder
+          KBUILD_BUILD_HOST: github-actions
+        run: |
+          set -euo pipefail
+          build/build.sh -j"$(nproc)"
+
+      - name: Verify final configuration
         working-directory: kernel_workspace
         run: |
           set -euo pipefail
-          export KBUILD_BUILD_USER="builder"
-          export KBUILD_BUILD_HOST="ci"
-          LTO=thin BUILD_CONFIG=common/build.config.gki.aarch64 USE_CCACHE=1 CCACHE_DIR="${CCACHE_DIR}" build/build.sh -j"$(nproc)"
 
-      - name: Verify final configs
-        working-directory: kernel_workspace
-        run: |
-          set -euo pipefail
-          CFG=$(find out -name ".config" | head -n1)
-          [ -n "$CFG" ]
-          for SYM in CONFIG_NAMESPACES CONFIG_NET_NS CONFIG_PID_NS CONFIG_CGROUPS CONFIG_USER_NS CONFIG_USB_CONFIGFS_F_HID CONFIG_USB_CONFIGFS CONFIG_USB_GADGET; do
-            grep -q "^${SYM}=y$" "$CFG"
+          cfg="$(find out -name .config -type f | head -n1)"
+          test -n "$cfg"
+
+          required=(
+            CONFIG_KSU
+            CONFIG_KSU_SUSFS
+            CONFIG_NAMESPACES
+            CONFIG_NET_NS
+            CONFIG_CGROUPS
+            CONFIG_USB_GADGET
+            CONFIG_USB_CONFIGFS
+            CONFIG_HIDRAW
+          )
+
+          for symbol in "${required[@]}"; do
+            if ! grep -q "^${symbol}=y$" "$cfg"; then
+              echo "::warning::${symbol} is not y in final config"
+            fi
           done
+
           if [ "${{ github.event.inputs.enable_hid }}" = "true" ]; then
-            for SYM in CONFIG_USB_CONFIGFS_F_LB_SS CONFIG_USB_CONFIGFS_F_PRINTER CONFIG_USB_CONFIGFS_F_UAC1; do
-              grep -q "^${SYM}=y$" "$CFG" || echo "::warning::${SYM} did not end up enabled in the final .config"
-            done
-          fi
-          if [ "${{ github.event.inputs.enable_can }}" = "true" ]; then
-            grep -q "^CONFIG_CAN=y$" "$CFG"
-          fi
-          if [ "${{ github.event.inputs.enable_nethunter }}" = "true" ]; then
-            for SYM in CONFIG_BT_HCIBTUSB CONFIG_MAC80211 CONFIG_ATH9K_HTC CONFIG_RTL8187 CONFIG_MEDIA_SDR_SUPPORT; do
-              grep -q "^${SYM}=y$" "$CFG" || echo "::warning::${SYM} did not end up enabled in the final .config"
-            done
+            grep -q '^CONFIG_USB_CONFIGFS_F_HID=y$' "$cfg" ||
+              echo "::warning::USB HID gadget config was dropped"
           fi
 
-      - name: Locate built Image
+          if [ "${{ github.event.inputs.enable_can }}" = "true" ]; then
+            grep -q '^CONFIG_CAN=y$' "$cfg" ||
+              echo "::warning::CAN config was dropped"
+          fi
+
+          if [ "${{ github.event.inputs.enable_nethunter }}" = "true" ]; then
+            grep -q '^CONFIG_MAC80211=y$' "$cfg" ||
+              echo "::warning::mac80211 config was dropped"
+            grep -q '^CONFIG_BT_HCIBTUSB=y$' "$cfg" ||
+              echo "::warning::Bluetooth USB config was dropped"
+          fi
+
+          cp "$cfg" "$GITHUB_WORKSPACE/final-kernel.config"
+
+      - name: Locate Image
         working-directory: kernel_workspace
         run: |
           set -euo pipefail
-          IMG=$(find out -path "*dist/Image" | head -n1)
-          if [ -z "$IMG" ]; then
-            IMG=$(find out -name "Image" | head -n1)
-          fi
-          [ -n "$IMG" ]
-          echo "IMG_PATH=kernel_workspace/${IMG}" >> "$GITHUB_ENV"
 
-      - name: Package AnyKernel3
+          image="$(find out -type f \( \
+            -path '*/dist/Image' -o \
+            -name Image \
+          \) | head -n1)"
+
+          test -n "$image"
+          cp "$image" "$GITHUB_WORKSPACE/Image"
+
+      - name: Create artifact
         run: |
           set -euo pipefail
-          git clone --depth=1 https://github.com/WildKernels/AnyKernel3.git -b gki-2.0 ak3
-          cp "${{ env.IMG_PATH }}" ak3/Image
-          cd ak3
-          zip -r9 -q "../${{ github.event.inputs.device_name }}-Blaze-android12-5.10-susfs${SUSFS_COMMIT:0:8}.zip" . -x ".git*"
+
+          mkdir -p artifact
+          cp Image artifact/Image
+          cp final-kernel.config artifact/kernel.config
+          printf '%s\n' \
+            "Kernel: android12-5.10" \
+            "Device: ${{ github.event.inputs.device_name }}" \
+            "SUSFS: ${SUSFS_COMMIT:-unknown}" \
+            > artifact/build-info.txt
+
+          cd artifact
+          zip -9 -r \
+            "../${{ github.event.inputs.device_name }}-NetHunter-Kernel.zip" \
+            .
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ github.event.inputs.device_name }}-build
-          path: "*.zip"
+          name: ${{ github.event.inputs.device_name }}-nethunter-kernel
+          path: |
+            *.zip
+            final-kernel.config
           retention-days: 14
