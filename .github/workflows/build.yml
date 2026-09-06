@@ -1,4 +1,4 @@
-name: Build Custom GKI Kernel (Wild KSU + SUSFS + BBRv3 + Full HID Support)
+name: Build Custom GKI Kernel (SukiSU-Ultra / ReSukiSU + SUSFS + BBRv3 + Full HID Support)
 
 on:
   workflow_dispatch:
@@ -11,6 +11,18 @@ on:
         description: "SUSFS commit hash (leave empty = latest on gki-android12-5.10 branch)"
         required: false
         default: ""
+      ksu_variant:
+        description: "Which KernelSU fork to build with. ReSukiSU is a re-fork of SukiSU-Ultra aimed at being more stable/updated more often — try it if sukisu builds start breaking."
+        required: true
+        type: choice
+        options:
+          - sukisu
+          - resukisu
+        default: "sukisu"
+      ksu_ref:
+        description: "Ref to check out on the chosen fork (branch/tag/commit). 'builtin' = always-latest dev branch with SUSFS baked in (can break mid-refactor). Pin an exact commit hash here for a reproducible/stable build."
+        required: true
+        default: "builtin"
       device_name:
         description: "Optional label for artifact naming"
         required: false
@@ -25,10 +37,6 @@ on:
         default: "true"
       enable_can:
         description: "Enable CAN bus support"
-        required: true
-        default: "true"
-      enable_rtl88xxu:
-        description: "Enable RTL8188CUS/RTL8192CU (rtl8xxxu) USB WiFi driver support"
         required: true
         default: "true"
 
@@ -148,11 +156,11 @@ jobs:
         run: |
           set -euo pipefail
           if [ "${SUBLEVEL}" -le "43" ]; then
-            perl -i -pe 's/(int|size_t)s+this_lens*=s*min_ts*(s*\u0001s*,/size_t this_len = min_t(size_t,/' fs/proc/base.c
+            perl -i -pe 's/(int|size_t)\s+this_len\s*=\s*min_t\s*\(\s*\1\s*,/size_t this_len = min_t(size_t,/' fs/proc/base.c
           fi
           if [ "${SUBLEVEL}" -le "117" ]; then
-            sed -i '#^[[:space:]]*/*$#,#^[[:space:]]*u32 mask = mark->mask & IN_ALL_EVENTS;$#d' fs/notify/fdinfo.c
-            perl -i -pe 's/\bmask,s*mark->ignored_mask/inotify_mark_user_mask(mark)/g' fs/notify/fdinfo.c
+            sed -i '\#^[[:space:]]*/\*$#,\#^[[:space:]]*u32 mask = mark->mask & IN_ALL_EVENTS;$#d' fs/notify/fdinfo.c
+            perl -i -pe 's/\bmask,\s*mark->ignored_mask/inotify_mark_user_mask(mark)/g' fs/notify/fdinfo.c
             perl -i -pe 's/ignored_mask:%x/ignored_mask:0/g' fs/notify/fdinfo.c
           fi
 
@@ -176,7 +184,7 @@ jobs:
             sed -i 's/^size_t this_len = min_t(size_t, count, PAGE_SIZE);$/int this_len = min_t(int, count, PAGE_SIZE);/' fs/proc/base.c
           fi
           if [ "${SUBLEVEL}" -le "117" ]; then
-            perl -i -pe 's#^(s+if (inode) {)#$1
+            perl -i -pe 's#^(\s+if \(inode\) \{)#$1
             \t\t/*
             \t\t * IN_ALL_EVENTS represents all of the mask bits
             \t\t * that we expose to userspace.  There is at
@@ -184,7 +192,7 @@ jobs:
             \t\t * used only internally to the kernel.
             \t\t */
             \t\tu32 mask = mark->mask & IN_ALL_EVENTS;#m' fs/notify/fdinfo.c
-            perl -i -pe 's/\binotify_mark_user_mask(mark)/mask, mark->ignored_mask/g' fs/notify/fdinfo.c
+            perl -i -pe 's/\binotify_mark_user_mask\(mark\)/mask, mark->ignored_mask/g' fs/notify/fdinfo.c
             perl -i -pe 's/ignored_mask:0/ignored_mask:%x/g' fs/notify/fdinfo.c
           fi
 
@@ -196,19 +204,75 @@ jobs:
             sed -i -e 's/goto show_pad;/return 0;/' ./fs/proc/task_mmu.c
           fi
 
-      - name: Setup KernelSU-Next
+      # SukiSU-Ultra / ReSukiSU replace KernelSU-Next here (pick with the
+      # ksu_variant input). ReSukiSU is a re-fork of SukiSU-Ultra kept in
+      # sync more aggressively, so it's a good fallback when SukiSU-Ultra's
+      # dev branch has a broken commit. For either fork, "main" is the v4
+      # modular tree (module-based, KPM-focused) and does NOT carry SUSFS
+      # support on the KSU side, while "builtin" is the source-embedded tree
+      # that already bundles the KSU-side SUSFS hooks. Passing a non-existent
+      # ref (like the old "susfs-main" convention some outdated guides
+      # mention) does NOT fail the build — setup.sh silently falls back to
+      # its default branch — so we verify the actual checked-out ref below
+      # instead of trusting it blindly.
+      - name: Setup KernelSU fork (SukiSU-Ultra / ReSukiSU)
         working-directory: kernel_workspace/common
         run: |
           set -euo pipefail
-          curl -fsSL "https://raw.githubusercontent.com/pershoot/KernelSU-Next/dev-susfs/kernel/setup.sh" | bash -s dev-susfs
+          case "${{ github.event.inputs.ksu_variant }}" in
+            resukisu)
+              REPO_OWNER="ReSukiSU"
+              REPO_NAME="ReSukiSU"
+              KSU_LABEL="ReSukiSU"
+              ;;
+            *)
+              REPO_OWNER="sukisu-ultra"
+              REPO_NAME="sukisu-ultra"
+              KSU_LABEL="SukiSU"
+              ;;
+          esac
+          SETUP_URL="https://raw.githubusercontent.com/${REPO_OWNER}/${REPO_NAME}/main/kernel/setup.sh"
+          echo "Fetching ${REPO_OWNER}/${REPO_NAME} @ ref '${{ github.event.inputs.ksu_ref }}'"
+          curl -fsSL "${SETUP_URL}" | bash -s "${{ github.event.inputs.ksu_ref }}"
 
-      - name: Fix KernelSU-Next static patch
-        working-directory: kernel_workspace/common/KernelSU-Next
+          ACTUAL_REF="$(git -C KernelSU rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)"
+          ACTUAL_COMMIT="$(git -C KernelSU rev-parse --short HEAD 2>/dev/null || echo unknown)"
+          echo "Checked out: ${ACTUAL_REF} (${ACTUAL_COMMIT})"
+          if [ "${ACTUAL_REF}" != "${{ github.event.inputs.ksu_ref }}" ]; then
+            echo "::warning::Requested ref '${{ github.event.inputs.ksu_ref }}' but HEAD landed on '${ACTUAL_REF}' (${ACTUAL_COMMIT}) — setup.sh may have silently fallen back to the default branch. If you expected SUSFS baked in, double check this ref actually exists on ${REPO_OWNER}/${REPO_NAME}."
+          fi
+          echo "KSU_LABEL=${KSU_LABEL}" >> "$GITHUB_ENV"
+          echo "SUKISU_COMMIT=${ACTUAL_COMMIT}" >> "$GITHUB_ENV"
+
+      # Best-effort auto-heal for known SukiSU-Ultra "builtin" churn.
+      # The builtin branch is an actively-refactored dev branch (feature/ksud
+      # rework in progress), so it occasionally lands commits where a
+      # feature struct registers a .set_handler that was never actually
+      # written (only the _get counterpart exists) — e.g. kernel_umount.c
+      # referencing an undefined kernel_umount_feature_set. When that
+      # specific pattern shows up, fall back to a NULL (read-only) setter so
+      # the build isn't blocked by upstream's in-progress work. This is a
+      # narrow, idempotent check: if upstream later ships the real function,
+      # HAS_DEF becomes >0 and this step does nothing.
+      - name: Auto-heal known SukiSU-Ultra builtin build breaks
+        working-directory: kernel_workspace/common
         run: |
           set -euo pipefail
-          curl -fsSL -o static.patch \
-            https://raw.githubusercontent.com/WildKernels/GKI_KernelSU_SUSFS/main/.github/actions/kernelsu/patches/static.patch
-          patch -p1 --forward < static.patch || true
+          FILE="drivers/kernelsu/feature/kernel_umount.c"
+          if [ -f "$FILE" ]; then
+            HAS_DEF=$(grep -cE 'kernel_umount_feature_set[[:space:]]*\(' "$FILE" || true)
+            REGISTERED=$(grep -c '\.set_handler[[:space:]]*=[[:space:]]*kernel_umount_feature_set' "$FILE" || true)
+            if [ "${REGISTERED:-0}" -ge 1 ] && [ "${HAS_DEF:-0}" -le "${REGISTERED:-0}" ]; then
+              echo "::warning::kernel_umount_feature_set is registered but not defined (known SukiSU-Ultra builtin WIP) — falling back to a read-only handler"
+              sed -i 's/\.set_handler[[:space:]]*=[[:space:]]*kernel_umount_feature_set,/.set_handler = NULL,/' "$FILE"
+            fi
+          fi
+
+      # NOTE: the old "Fix KernelSU-Next static patch" step is intentionally
+      # removed. That patch (from WildKernels/GKI_KernelSU_SUSFS) targeted a
+      # static-assertion bug specific to the pershoot/KernelSU-Next fork and
+      # its KernelSU-Next/ directory layout — it doesn't apply to SukiSU-Ultra
+      # and there's nothing to replace it with unless a build error surfaces.
 
       - name: Install Baseband Guard
         if: ${{ github.event.inputs.enable_bbg == 'true' }}
@@ -240,7 +304,7 @@ jobs:
           BBRV3_PATCH_APPLIED="false"
           if [ -f "$BBRV3_PATCH" ] && patch -p1 < "$BBRV3_PATCH"; then
             BBRV3_PATCH_APPLIED="true"
-            DETECTED="$(grep -rhoE '.names*=s*"[a-zA-Z0-9_]+"' net/ipv4/tcp_bbr*.c 2>/dev/null | grep -oE '"[a-zA-Z0-9_]+"' | tr -d '"' | head -n1 || true)"
+            DETECTED="$(grep -rhoE '\.name\s*=\s*"[a-zA-Z0-9_]+"' net/ipv4/tcp_bbr*.c 2>/dev/null | grep -oE '"[a-zA-Z0-9_]+"' | tr -d '"' | head -n1 || true)"
             [ -n "$DETECTED" ] && BBR_CONG_NAME="$DETECTED"
           fi
           echo "BBR_CONG_NAME=${BBR_CONG_NAME}" >> "$GITHUB_ENV"
@@ -361,22 +425,6 @@ jobs:
             echo "CONFIG_UHID=y"
           } >> gki_defconfig
 
-      - name: Set RTL8xxxu USB WiFi driver configs
-        if: ${{ github.event.inputs.enable_rtl88xxu == 'true' }}
-        run: |
-          cd kernel_workspace/common/arch/arm64/configs
-          # Covers RTL8188CUS / RTL8192CU / RTL8188RU / RTL8723AU USB dongles
-          # (e.g. bus 0bda:8176 shown by StrykerOSS as "DRIVER UNKNOWN").
-          # rtl8xxxu is the mainline in-tree driver; it needs mac80211 +
-          # cfg80211 as dependencies to even show up in Kconfig.
-          {
-            echo "CONFIG_WLAN=y"
-            echo "CONFIG_CFG80211=y"
-            echo "CONFIG_MAC80211=y"
-            echo "CONFIG_RTL8XXXU=m"
-            echo "CONFIG_RTL8XXXU_UNTESTED=y"
-          } >> gki_defconfig
-
       - name: Set CAN bus configs
         if: ${{ github.event.inputs.enable_can == 'true' }}
         run: |
@@ -430,9 +478,9 @@ jobs:
           set -euo pipefail
           mv scripts/setlocalversion scripts/setlocalversion.orig
           chmod +x scripts/setlocalversion.orig
-          cat > scripts/setlocalversion << 'EOF'
+          cat > scripts/setlocalversion << EOF
           #!/bin/sh
-          printf -- '-BLAZE-KSUNv1-STABLE'
+          printf -- '-BLAZE-${KSU_LABEL:-SukiSU}-STABLE'
 
           EOF
           chmod +x scripts/setlocalversion
@@ -445,7 +493,17 @@ jobs:
         working-directory: kernel_workspace/common
         run: |
           set -euo pipefail
+          # We've added new =m modules that aren't in the upstream
+          # android/gki_aarch64_modules allow-list. The GKI build compares the
+          # generated modules.order against the file pointed to by MODULES_ORDER
+          # (usually android/gki_aarch64_modules) and fails with "modules list
+          # out of date" on any mismatch. Blank MODULES_ORDER in every
+          # build.config* so build.sh skips that diff check entirely. This only
+          # disables the build-time bookkeeping comparison — it does not change
+          # which modules get compiled, built into the Image, or loaded at runtime,
+          # so it carries no bootloop risk on its own.
           grep -rl '^MODULES_ORDER=' build.config* 2>/dev/null | xargs -r sed -i 's/^MODULES_ORDER=.*/MODULES_ORDER=/' || true
+          # Also cover MODULES_LIST in case a downstream config uses that name instead.
           grep -rl '^MODULES_LIST=' build.config* 2>/dev/null | xargs -r sed -i 's/^MODULES_LIST=.*/MODULES_LIST=/' || true
 
       - name: Build kernel
@@ -462,7 +520,7 @@ jobs:
           set -euo pipefail
           CFG=$(find out -name ".config" | head -n1)
           [ -n "$CFG" ]
-          for SYM in CONFIG_NAMESPACES CONFIG_NET_NS CONFIG_PID_NS CONFIG_CGROUPS CONFIG_USER_NS CONFIG_USB_CONFIGFS_F_HID CONFIG_USB_CONFIGFS CONFIG_USB_GADGET; do
+          for SYM in CONFIG_NAMESPACES CONFIG_NET_NS CONFIG_PID_NS CONFIG_CGROUPS CONFIG_USER_NS CONFIG_USB_CONFIGFS_F_HID CONFIG_USB_CONFIGFS CONFIG_USB_GADGET CONFIG_KSU CONFIG_KSU_SUSFS; do
             grep -q "^${SYM}=y$" "$CFG"
           done
           if [ "${{ github.event.inputs.enable_hid }}" = "true" ]; then
@@ -472,12 +530,6 @@ jobs:
           fi
           if [ "${{ github.event.inputs.enable_can }}" = "true" ]; then
             grep -q "^CONFIG_CAN=y$" "$CFG"
-          fi
-          if [ "${{ github.event.inputs.enable_rtl88xxu }}" = "true" ]; then
-            for SYM in CONFIG_CFG80211 CONFIG_MAC80211; do
-              grep -q "^${SYM}=y$" "$CFG"
-            done
-            grep -q "^CONFIG_RTL8XXXU=m$" "$CFG" || echo "::warning::CONFIG_RTL8XXXU did not end up enabled in the final .config"
           fi
 
       - name: Locate built Image
