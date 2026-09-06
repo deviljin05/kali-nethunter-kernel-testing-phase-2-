@@ -537,7 +537,7 @@ jobs:
           chmod +x scripts/setlocalversion.orig
           cat > scripts/setlocalversion << EOF
           #!/bin/sh
-          printf -- '-BLAZE-${KSU_LABEL:-SukiSU}-STABLE'
+          printf -- '-BLAZE-STABLE'
 
           EOF
           chmod +x scripts/setlocalversion
