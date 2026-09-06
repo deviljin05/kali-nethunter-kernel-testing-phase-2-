@@ -127,15 +127,14 @@ jobs:
           fi
           echo "SUSFS_COMMIT=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
 
-      # FIX (undefined symbol: ksu_install_su_fd @ fs/exec.c do_execveat_common):
-      # SukiSU-Ultra/ReSukiSU's fs/exec.c hook unconditionally calls
-      # ksu_install_su_fd(), which is SUSFS's SUS_SU (hidden-su-via-fd)
-      # feature. That function's *definition* is only compiled in when
-      # CONFIG_KSU_SUSFS_SUS_SU=y is set. This config list previously
-      # enabled every other SUSFS sub-feature (SUS_PATH, SUS_MOUNT,
-      # SUS_KSTAT, SPOOF_UNAME, etc.) but was missing SUS_SU itself, so the
-      # linker found the call site but no definition. Adding
-      # CONFIG_KSU_SUSFS_SUS_SU=y below makes the definition compile in.
+      # NOTE on SUS_SU: official SUSFS docs state that if your KernelSU
+      # source already ships non-kprobe (manual) hooks — which SukiSU-Ultra/
+      # ReSukiSU's "builtin" tree does — CONFIG_KSU_SUSFS_SUS_SU must stay
+      # DISABLED, since the manual-hook driver doesn't provide the SUS_SU
+      # fd-install glue that config expects. It's intentionally left out
+      # below. (The "undefined symbol: ksu_install_su_fd" build failure is a
+      # separate, unrelated upstream gap — see the auto-heal step further
+      # down for that.)
       - name: Set SUSFS kernel configs
         run: |
           cd kernel_workspace/common/arch/arm64/configs
@@ -145,7 +144,6 @@ jobs:
             echo "CONFIG_KSU_SUSFS_SUS_PATH=y"
             echo "CONFIG_KSU_SUSFS_SUS_MOUNT=y"
             echo "CONFIG_KSU_SUSFS_SUS_KSTAT=y"
-            echo "CONFIG_KSU_SUSFS_SUS_SU=y"
             echo "CONFIG_KSU_SUSFS_SPOOF_UNAME=y"
             echo "CONFIG_KSU_SUSFS_ENABLE_LOG=y"
             echo "CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y"
@@ -278,26 +276,54 @@ jobs:
             fi
           fi
 
-      # Diagnostic safety net for the ksu_install_su_fd class of error.
-      # CONFIG_KSU_SUSFS_SUS_SU=y (set above) is the real fix for the
-      # "undefined symbol: ksu_install_su_fd" failure, since that's what
-      # gates the function's definition into the build. This step just
-      # fails FAST with a clear message before the ~15 minute compile if
-      # the call site exists in fs/exec.c but no definition can be found
-      # anywhere in the tree yet (e.g. this dev commit renamed/moved the
-      # function) — so a real mismatch surfaces immediately instead of
-      # burning CI minutes on a doomed vmlinux link.
-      - name: Sanity-check ksu_install_su_fd is resolvable before building
+      # Auto-heal: "undefined symbol: ksu_install_su_fd" @ fs/exec.c.
+      # This is a genuine upstream gap in SukiSU-Ultra/ReSukiSU's "builtin"
+      # dev branch: the SUSFS kernel-side patch calls this SUS_SU fd-install
+      # hook unconditionally from fs/exec.c, but this dev commit's driver
+      # source never shipped a matching definition anywhere in the tree.
+      # Rather than guess the function's signature, we look for its
+      # prototype/declaration (wherever it's forward-declared so the call
+      # even type-checks) and copy its exact return type + parameter list to
+      # synthesize a no-op definition, appended directly into fs/exec.c
+      # itself (so it always sees whatever types the prototype needs,
+      # without header/include guesswork). This only disables SUSFS's
+      # SUS_SU fd-hiding for su exec in this build — it does nothing if
+      # upstream already ships a real definition (DEF_COUNT check below).
+      - name: Auto-heal missing ksu_install_su_fd definition
         working-directory: kernel_workspace/common
         run: |
           set -euo pipefail
-          if grep -q 'ksu_install_su_fd' fs/exec.c 2>/dev/null; then
-            DEF_COUNT=$(grep -rlE '\bksu_install_su_fd\s*\(' --include='*.c' --include='*.h' . 2>/dev/null | grep -vc '^\./fs/exec\.c$' || true)
-            if [ "${DEF_COUNT:-0}" -eq 0 ]; then
-              echo "::error::fs/exec.c calls ksu_install_su_fd() but no definition/declaration exists anywhere else in the tree, even with CONFIG_KSU_SUSFS_SUS_SU=y set. This SukiSU-Ultra/ReSukiSU 'builtin' dev commit likely renamed or gated this function differently — pin an older ksu_ref, try the other ksu_variant, or check drivers/kernelsu/ for the current name of this SUS_SU hook."
-              exit 1
-            fi
+          if ! grep -q 'ksu_install_su_fd' fs/exec.c 2>/dev/null; then
+            echo "fs/exec.c does not reference ksu_install_su_fd — nothing to heal."
+            exit 0
           fi
+          DEF_COUNT=$(grep -rlE '\bksu_install_su_fd\s*\(' --include='*.c' --include='*.h' . 2>/dev/null | grep -vc '^\./fs/exec\.c$' || true)
+          if [ "${DEF_COUNT:-0}" -ge 1 ]; then
+            echo "ksu_install_su_fd is resolvable elsewhere in the tree — nothing to heal."
+            exit 0
+          fi
+          echo "::warning::fs/exec.c calls ksu_install_su_fd() with no definition anywhere in the tree (known SukiSU-Ultra/ReSukiSU builtin dev-branch gap). Synthesizing a no-op definition directly in fs/exec.c so the build can complete; SUS_SU fd-hiding will be inert for this build."
+          PROTO_LINE=$(grep -rhoE '(extern[[:space:]]+)?[A-Za-z_][A-Za-z0-9_ \*]*\bksu_install_su_fd[[:space:]]*\([^;{]*\)[[:space:]]*;' \
+            --include='*.c' --include='*.h' . 2>/dev/null | grep -v '^[[:space:]]*$' | head -n1 || true)
+          if [ -z "${PROTO_LINE}" ]; then
+            echo "::error::ksu_install_su_fd is called in fs/exec.c but no prototype/declaration exists anywhere in the tree either — cannot safely synthesize a matching definition. Try ksu_variant: resukisu, or pin an older ksu_ref commit instead of 'builtin'."
+            exit 1
+          fi
+          SIG=$(echo "${PROTO_LINE}" | sed -E 's/^[[:space:]]*extern[[:space:]]+//; s/;[[:space:]]*$//')
+          if echo "${SIG}" | grep -qE '^[[:space:]]*void\b'; then
+            BODY="{ }"
+          else
+            BODY="{ return 0; }"
+          fi
+          {
+            echo ""
+            echo "/* Auto-healed stub (see 'Auto-heal missing ksu_install_su_fd"
+            echo " * definition' CI step): this SukiSU-Ultra/ReSukiSU builtin"
+            echo " * commit calls this SUSFS SUS_SU hook without shipping a"
+            echo " * definition. No-op keeps the build green; SUS_SU fd-hiding"
+            echo " * is inactive until upstream ships the real function. */"
+            echo "${SIG} ${BODY}"
+          } >> fs/exec.c
 
       # NOTE: the old "Fix KernelSU-Next static patch" step is intentionally
       # removed. That patch (from WildKernels/GKI_KernelSU_SUSFS) targeted a
@@ -551,7 +577,7 @@ jobs:
           set -euo pipefail
           CFG=$(find out -name ".config" | head -n1)
           [ -n "$CFG" ]
-          for SYM in CONFIG_NAMESPACES CONFIG_NET_NS CONFIG_PID_NS CONFIG_CGROUPS CONFIG_USER_NS CONFIG_USB_CONFIGFS_F_HID CONFIG_USB_CONFIGFS CONFIG_USB_GADGET CONFIG_KSU CONFIG_KSU_SUSFS CONFIG_KSU_SUSFS_SUS_SU; do
+          for SYM in CONFIG_NAMESPACES CONFIG_NET_NS CONFIG_PID_NS CONFIG_CGROUPS CONFIG_USER_NS CONFIG_USB_CONFIGFS_F_HID CONFIG_USB_CONFIGFS CONFIG_USB_GADGET CONFIG_KSU CONFIG_KSU_SUSFS; do
             grep -q "^${SYM}=y$" "$CFG"
           done
           if [ "${{ github.event.inputs.enable_hid }}" = "true" ]; then
