@@ -12,7 +12,7 @@ on:
         required: false
         default: ""
       ksu_variant:
-        description: "Which KernelSU manager/fork to build with. ReSukiSU = SukiSU-Ultra re-fork (more stable/frequent updates). MamboSU = RapliVx/KernelSU. kernelsu-next = KernelSU-Next. kowsu = KOWX712/KernelSU."
+        description: "Which KernelSU manager/fork to build with. ReSukiSU = SukiSU-Ultra re-fork (more stable/frequent updates). MamboSU = RapliVx/KernelSU. kernelsu-next = KernelSU-Next. kowsu = KOWX712/KernelSU. vanilla = no root manager baked in at all (no KernelSU, no SUSFS) — root it yourself afterward with Magisk or any other root manager."
         required: true
         type: choice
         options:
@@ -21,9 +21,10 @@ on:
           - mambosu
           - kernelsu-next
           - kowsu
+          - vanilla
         default: "sukisu"
       ksu_ref:
-        description: "Ref to check out on the chosen fork (branch/tag/commit). Leave as 'builtin' to auto-pick each fork's latest-dev default (sukisu/resukisu: builtin branch, mambosu: master, kernelsu-next: dev, kowsu: main). Pin an exact commit/tag here for a reproducible/stable build instead."
+        description: "Ref to check out on the chosen fork (branch/tag/commit). Ignored when ksu_variant is 'vanilla'. Leave as 'builtin' to auto-pick each fork's latest-dev default (sukisu/resukisu: builtin branch, mambosu: susfs-rksu-master, kernelsu-next: dev, kowsu: main). Pin an exact commit/tag here for a reproducible/stable build instead."
         required: true
         default: "builtin"
       device_name:
@@ -120,6 +121,7 @@ jobs:
           echo "SUBLEVEL=${SUBLEVEL}" >> "$GITHUB_ENV"
 
       - name: Clone SUSFS4KSU
+        if: ${{ github.event.inputs.ksu_variant != 'vanilla' }}
         working-directory: kernel_workspace
         run: |
           set -euo pipefail
@@ -139,6 +141,7 @@ jobs:
       # separate, unrelated upstream gap — see the auto-heal step further
       # down for that.)
       - name: Set SUSFS kernel configs
+        if: ${{ github.event.inputs.ksu_variant != 'vanilla' }}
         run: |
           cd kernel_workspace/common/arch/arm64/configs
           {
@@ -156,6 +159,7 @@ jobs:
           } >> gki_defconfig
 
       - name: Copy SUSFS kernel patches
+        if: ${{ github.event.inputs.ksu_variant != 'vanilla' }}
         run: |
           cd kernel_workspace/common
           cp ../susfs4ksu/kernel_patches/fs/* ./fs/
@@ -163,6 +167,7 @@ jobs:
           cp ../susfs4ksu/kernel_patches/50_add_susfs_in_gki-android12-5.10.patch ./
 
       - name: Apply android12-5.10 pre-patch compatibility fixes
+        if: ${{ github.event.inputs.ksu_variant != 'vanilla' }}
         working-directory: kernel_workspace/common
         run: |
           set -euo pipefail
@@ -176,18 +181,21 @@ jobs:
           fi
 
       - name: Apply SUSFS kernel patch
+        if: ${{ github.event.inputs.ksu_variant != 'vanilla' }}
         working-directory: kernel_workspace/common
         run: |
           set -euo pipefail
           patch -p1 --fuzz=3 < 50_add_susfs_in_gki-android12-5.10.patch
 
       - name: Fix SUSFS set_nameidata argument mismatch
+        if: ${{ github.event.inputs.ksu_variant != 'vanilla' }}
         working-directory: kernel_workspace/common
         run: |
           set -euo pipefail
           sed -i 's/set_nameidata(nd, old_dfd, fake_filename, NULL);/set_nameidata(nd, old_dfd, fake_filename);/g' fs/namei.c
 
       - name: Revert android12-5.10 pre-patch compatibility fixes
+        if: ${{ github.event.inputs.ksu_variant != 'vanilla' }}
         working-directory: kernel_workspace/common
         run: |
           set -euo pipefail
@@ -208,6 +216,7 @@ jobs:
           fi
 
       - name: Apply SUSFS show_pad fix
+        if: ${{ github.event.inputs.ksu_variant != 'vanilla' }}
         working-directory: kernel_workspace/common
         run: |
           set -euo pipefail
@@ -251,6 +260,7 @@ jobs:
       # setup.sh silently falls back to its own default branch — so we
       # verify the actual checked-out ref below instead of trusting it.
       - name: Setup KernelSU manager (SukiSU-Ultra / ReSukiSU / MamboSU / KernelSU-Next / KOWSU)
+        if: ${{ github.event.inputs.ksu_variant != 'vanilla' }}
         working-directory: kernel_workspace/common
         run: |
           set -euo pipefail
@@ -328,6 +338,7 @@ jobs:
       # narrow, idempotent check: if upstream later ships the real function,
       # HAS_DEF becomes >0 and this step does nothing.
       - name: Auto-heal known SukiSU-Ultra builtin build breaks
+        if: ${{ github.event.inputs.ksu_variant != 'vanilla' }}
         working-directory: kernel_workspace/common
         run: |
           set -euo pipefail
@@ -355,6 +366,7 @@ jobs:
       # SUS_SU fd-hiding for su exec in this build — it does nothing if
       # upstream already ships a real definition (DEF_COUNT check below).
       - name: Auto-heal missing ksu_install_su_fd definition
+        if: ${{ github.event.inputs.ksu_variant != 'vanilla' }}
         working-directory: kernel_workspace/common
         run: |
           set -euo pipefail
@@ -642,16 +654,22 @@ jobs:
           set -euo pipefail
           CFG=$(find out -name ".config" | head -n1)
           [ -n "$CFG" ]
-          # CONFIG_KSU is required across every manager (it's the whole
-          # point). CONFIG_KSU_SUSFS is checked separately as a soft warning
-          # below, since not every manager fork's Kconfig actually exposes
-          # that option (e.g. kowsu, or mambosu if built off plain "master"
-          # instead of its susfs-rksu-master branch) — the kernel is still a
-          # perfectly valid rooted build without it, just without SUSFS.
-          for SYM in CONFIG_NAMESPACES CONFIG_NET_NS CONFIG_PID_NS CONFIG_CGROUPS CONFIG_USER_NS CONFIG_USB_CONFIGFS_F_HID CONFIG_USB_CONFIGFS CONFIG_USB_GADGET CONFIG_KSU; do
+          # CONFIG_KSU is required for every manager except vanilla (which
+          # intentionally has no root manager baked in at all — root is
+          # applied afterward via Magisk or another manager on the built
+          # boot image). CONFIG_KSU_SUSFS is checked separately as a soft
+          # warning below, since not every manager fork's Kconfig actually
+          # exposes that option (e.g. kowsu, or mambosu if built off plain
+          # "master" instead of its susfs-rksu-master branch) — the kernel
+          # is still a perfectly valid rooted build without it, just
+          # without SUSFS.
+          for SYM in CONFIG_NAMESPACES CONFIG_NET_NS CONFIG_PID_NS CONFIG_CGROUPS CONFIG_USER_NS CONFIG_USB_CONFIGFS_F_HID CONFIG_USB_CONFIGFS CONFIG_USB_GADGET; do
             grep -q "^${SYM}=y$" "$CFG"
           done
-          grep -q "^CONFIG_KSU_SUSFS=y$" "$CFG" || echo "::warning::CONFIG_KSU_SUSFS did not end up enabled in the final .config — the selected ksu_variant/ksu_ref likely doesn't expose SUSFS support in its Kconfig. The kernel still built with plain root; SUSFS hiding just won't be active."
+          if [ "${{ github.event.inputs.ksu_variant }}" != "vanilla" ]; then
+            grep -q "^CONFIG_KSU=y$" "$CFG"
+            grep -q "^CONFIG_KSU_SUSFS=y$" "$CFG" || echo "::warning::CONFIG_KSU_SUSFS did not end up enabled in the final .config — the selected ksu_variant/ksu_ref likely doesn't expose SUSFS support in its Kconfig. The kernel still built with plain root; SUSFS hiding just won't be active."
+          fi
           if [ "${{ github.event.inputs.enable_hid }}" = "true" ]; then
             for SYM in CONFIG_USB_CONFIGFS_F_LB_SS CONFIG_USB_CONFIGFS_F_PRINTER CONFIG_USB_CONFIGFS_F_UAC1; do
               grep -q "^${SYM}=y$" "$CFG" || echo "::warning::${SYM} did not end up enabled in the final .config"
@@ -678,7 +696,13 @@ jobs:
           git clone --depth=1 https://github.com/WildKernels/AnyKernel3.git -b gki-2.0 ak3
           cp "${{ env.IMG_PATH }}" ak3/Image
           cd ak3
-          zip -r9 -q "../${{ github.event.inputs.device_name }}-Blaze-android12-5.10-susfs${SUSFS_COMMIT:0:8}.zip" . -x ".git*"
+          if [ "${{ github.event.inputs.ksu_variant }}" = "vanilla" ]; then
+            SUFFIX="vanilla"
+          else
+            COMMIT_SHORT="${SUSFS_COMMIT:-none}"
+            SUFFIX="susfs${COMMIT_SHORT:0:8}"
+          fi
+          zip -r9 -q "../${{ github.event.inputs.device_name }}-Blaze-android12-5.10-${SUFFIX}.zip" . -x ".git*"
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
