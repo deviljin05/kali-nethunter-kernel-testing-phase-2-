@@ -12,7 +12,7 @@ on:
         required: false
         default: ""
       ksu_variant:
-        description: "Which KernelSU manager/fork to build with. ReSukiSU = SukiSU-Ultra re-fork (more stable/frequent updates). MamboSU = RapliVx/KernelSU. kernelsu-next = KernelSU-Next."
+        description: "Which KernelSU manager/fork to build with. ReSukiSU = SukiSU-Ultra re-fork (more stable/frequent updates). MamboSU = RapliVx/KernelSU. kernelsu-next = KernelSU-Next. kowsu = KOWX712/KernelSU."
         required: true
         type: choice
         options:
@@ -20,9 +20,10 @@ on:
           - resukisu
           - mambosu
           - kernelsu-next
+          - kowsu
         default: "sukisu"
       ksu_ref:
-        description: "Ref to check out on the chosen fork (branch/tag/commit). Leave as 'builtin' to auto-pick each fork's latest-dev default (sukisu/resukisu: builtin branch, mambosu: master, kernelsu-next: dev). Pin an exact commit/tag here for a reproducible/stable build instead."
+        description: "Ref to check out on the chosen fork (branch/tag/commit). Leave as 'builtin' to auto-pick each fork's latest-dev default (sukisu/resukisu: builtin branch, mambosu: master, kernelsu-next: dev, kowsu: main). Pin an exact commit/tag here for a reproducible/stable build instead."
         required: true
         default: "builtin"
       device_name:
@@ -214,30 +215,42 @@ jobs:
             sed -i -e 's/goto show_pad;/return 0;/' ./fs/proc/task_mmu.c
           fi
 
-      # Four managers selectable via ksu_variant:
+      # Five managers selectable via ksu_variant:
       #   sukisu         -> sukisu-ultra/sukisu-ultra, setup.sh on "main",
       #                      "builtin" ref = source-embedded tree w/ SUSFS baked in.
       #   resukisu       -> ReSukiSU/ReSukiSU (re-fork of SukiSU-Ultra, kept
       #                      in sync more aggressively — good fallback if
       #                      sukisu's dev branch has a broken commit).
       #   mambosu        -> RapliVx/KernelSU, setup.sh on "master". Has no
-      #                      "builtin" branch, so when ksu_ref is left at the
-      #                      generic default we fall back to "master" (its
-      #                      documented default install branch). It also has
-      #                      a "susfs-rksu-master" branch, but upstream
-      #                      itself warns that one isn't always updated —
-      #                      pass ksu_ref: susfs-rksu-master explicitly if
-      #                      you want to try it.
+      #                      "builtin" branch, and since this whole workflow
+      #                      exists to build WITH SUSFS, the generic default
+      #                      falls back to its "susfs-rksu-master" branch
+      #                      (the one that actually wires CONFIG_KSU_SUSFS) —
+      #                      upstream does warn this branch isn't always kept
+      #                      current, so pin ksu_ref to a specific commit on
+      #                      it, or pass ksu_ref: master explicitly if you'd
+      #                      rather have plain root with no SUSFS from this
+      #                      fork.
       #   kernelsu-next  -> KernelSU-Next/KernelSU-Next, setup.sh on "next".
       #                      Doesn't use "builtin" either — its ref argument
       #                      is dev/stable/legacy/vX.Y.Z — so the generic
       #                      default falls back to "dev" (latest dev branch).
+      #   kowsu          -> KOWX712/KernelSU, a personal fork (Material
+      #                      theming-focused manager) of the standard
+      #                      tiann/KernelSU tree, setup.sh on "main". No
+      #                      "builtin" branch either, so the generic default
+      #                      falls back to "main" (its dev branch). Being a
+      #                      plain tiann/KernelSU-based fork, it likely does
+      #                      NOT expose the CONFIG_KSU_SUSFS Kconfig option at
+      #                      all — see the SUSFS check in "Verify final
+      #                      configs" below, which is a soft warning rather
+      #                      than a hard failure for exactly this reason.
       # For sukisu/resukisu, "main" is the v4 modular/KPM tree (no KSU-side
       # SUSFS), "builtin" is the source-embedded tree with SUSFS hooks. A
       # non-existent ref does NOT fail the build for any of these forks —
       # setup.sh silently falls back to its own default branch — so we
       # verify the actual checked-out ref below instead of trusting it.
-      - name: Setup KernelSU manager (SukiSU-Ultra / ReSukiSU / MamboSU / KernelSU-Next)
+      - name: Setup KernelSU manager (SukiSU-Ultra / ReSukiSU / MamboSU / KernelSU-Next / KOWSU)
         working-directory: kernel_workspace/common
         run: |
           set -euo pipefail
@@ -256,7 +269,7 @@ jobs:
               KSU_LABEL="MamboSU"
               SETUP_BRANCH="master"
               if [ "${REQUESTED_REF}" = "builtin" ]; then
-                REF="master"
+                REF="susfs-rksu-master"
               else
                 REF="${REQUESTED_REF}"
               fi
@@ -268,6 +281,17 @@ jobs:
               SETUP_BRANCH="next"
               if [ "${REQUESTED_REF}" = "builtin" ]; then
                 REF="dev"
+              else
+                REF="${REQUESTED_REF}"
+              fi
+              ;;
+            kowsu)
+              REPO_OWNER="KOWX712"
+              REPO_NAME="KernelSU"
+              KSU_LABEL="KOWSU"
+              SETUP_BRANCH="main"
+              if [ "${REQUESTED_REF}" = "builtin" ]; then
+                REF="main"
               else
                 REF="${REQUESTED_REF}"
               fi
@@ -618,9 +642,16 @@ jobs:
           set -euo pipefail
           CFG=$(find out -name ".config" | head -n1)
           [ -n "$CFG" ]
-          for SYM in CONFIG_NAMESPACES CONFIG_NET_NS CONFIG_PID_NS CONFIG_CGROUPS CONFIG_USER_NS CONFIG_USB_CONFIGFS_F_HID CONFIG_USB_CONFIGFS CONFIG_USB_GADGET CONFIG_KSU CONFIG_KSU_SUSFS; do
+          # CONFIG_KSU is required across every manager (it's the whole
+          # point). CONFIG_KSU_SUSFS is checked separately as a soft warning
+          # below, since not every manager fork's Kconfig actually exposes
+          # that option (e.g. kowsu, or mambosu if built off plain "master"
+          # instead of its susfs-rksu-master branch) — the kernel is still a
+          # perfectly valid rooted build without it, just without SUSFS.
+          for SYM in CONFIG_NAMESPACES CONFIG_NET_NS CONFIG_PID_NS CONFIG_CGROUPS CONFIG_USER_NS CONFIG_USB_CONFIGFS_F_HID CONFIG_USB_CONFIGFS CONFIG_USB_GADGET CONFIG_KSU; do
             grep -q "^${SYM}=y$" "$CFG"
           done
+          grep -q "^CONFIG_KSU_SUSFS=y$" "$CFG" || echo "::warning::CONFIG_KSU_SUSFS did not end up enabled in the final .config — the selected ksu_variant/ksu_ref likely doesn't expose SUSFS support in its Kconfig. The kernel still built with plain root; SUSFS hiding just won't be active."
           if [ "${{ github.event.inputs.enable_hid }}" = "true" ]; then
             for SYM in CONFIG_USB_CONFIGFS_F_LB_SS CONFIG_USB_CONFIGFS_F_PRINTER CONFIG_USB_CONFIGFS_F_UAC1; do
               grep -q "^${SYM}=y$" "$CFG" || echo "::warning::${SYM} did not end up enabled in the final .config"
