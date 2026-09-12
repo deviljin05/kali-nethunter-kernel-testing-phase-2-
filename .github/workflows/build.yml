@@ -1,32 +1,16 @@
-name: Build Custom GKI Kernel (SukiSU-Ultra / ReSukiSU / MamboSU / KernelSU-Next + SUSFS + BBRv3 + Full HID Support)
+name: Build Custom GKI Kernel (ReSuKisu + SUSFS + BBRv3 + CAN)
 
 on:
   workflow_dispatch:
     inputs:
       os_patch_level:
-        description: "'lts' = rolling LTS branch. Or pin an exact GKI release tag, e.g. android12-5.10.264_r00"
+        description: "'lts' = rolling common-android12-5.10 branch (recommended). Or give an exact tag (e.g. android12-5.10.264_r00) or a dated maintenance branch (e.g. android12-5.10-2026-07)."
         required: true
-        default: "android12-5.10.264_r00"
+        default: "lts"
       susfs_commit:
-        description: "SUSFS commit hash (leave empty = latest on gki-android12-5.10 branch)"
+        description: "SUSFS commit hash on gki-android12-5.10 branch. Pinned by default to a known-working commit."
         required: false
-        default: ""
-      ksu_variant:
-        description: "Which KernelSU manager/fork to build with. ReSukiSU = SukiSU-Ultra re-fork (more stable/frequent updates). MamboSU = RapliVx/KernelSU. kernelsu-next = KernelSU-Next. kowsu = KOWX712/KernelSU. vanilla = no root manager baked in at all (no KernelSU, no SUSFS) — root it yourself afterward with Magisk or any other root manager."
-        required: true
-        type: choice
-        options:
-          - sukisu
-          - resukisu
-          - mambosu
-          - kernelsu-next
-          - kowsu
-          - vanilla
-        default: "sukisu"
-      ksu_ref:
-        description: "Ref to check out on the chosen fork (branch/tag/commit). Ignored when ksu_variant is 'vanilla'. Leave as 'builtin' to auto-pick each fork's latest-dev default (sukisu/resukisu: builtin branch, mambosu: susfs-rksu-master, kernelsu-next: dev, kowsu: main). Pin an exact commit/tag here for a reproducible/stable build instead."
-        required: true
-        default: "builtin"
+        default: "ec785f47d49f7b3871ca9356f450411020af7017"
       device_name:
         description: "Optional label for artifact naming"
         required: false
@@ -35,14 +19,14 @@ on:
         description: "Enable Baseband Guard (BBG)"
         required: true
         default: "true"
-      enable_hid:
-        description: "Enable full USB HID gadget support"
+      kernel_lto:
+        description: "LTO mode for the build"
         required: true
-        default: "true"
-      enable_can:
-        description: "Enable CAN bus support"
-        required: true
-        default: "true"
+        default: "thin"
+        type: choice
+        options:
+          - thin
+          - none
 
 env:
   VERSION: android12-5.10
@@ -52,7 +36,6 @@ jobs:
   build:
     runs-on: ubuntu-22.04
     timeout-minutes: 150
-
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
@@ -62,66 +45,81 @@ jobs:
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc || true
           sudo apt-get clean
 
+      - name: Set up 16GB swap
+        run: |
+          set -euo pipefail
+          echo "Existing swap before:"; swapon --show || true; free -h
+          sudo fallocate -l 16G /swapfile_ci
+          sudo chmod 600 /swapfile_ci
+          sudo mkswap /swapfile_ci
+          sudo swapon /swapfile_ci
+          echo "Swap after:"; swapon --show; free -h
+
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y git curl bc bison flex libssl-dev \
+          sudo apt-get install -y git curl wget bc bison flex libssl-dev \
             build-essential python3 python3-pip libncurses-dev \
-            ccache zip unzip device-tree-compiler
+            ccache zip unzip rsync cpio kmod libelf-dev dwarves \
+            device-tree-compiler \
+            clang llvm lld \
+            binutils-aarch64-linux-gnu gcc-aarch64-linux-gnu
 
       - name: Install repo tool
         run: |
           mkdir -p ~/bin
-          curl -fsSL https://storage.googleapis.com/git-repo-downloads/repo -o ~/bin/repo
+          curl https://storage.googleapis.com/git-repo-downloads/repo > ~/bin/repo
           chmod a+x ~/bin/repo
           echo "$HOME/bin" >> "$GITHUB_PATH"
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
 
       - name: Set up ccache
-        run: mkdir -p "${CCACHE_DIR}"
-
-      - name: Resolve manifest branch and optional pinned release tag
-        run: |
-          set -euo pipefail
-          INPUT="${{ github.event.inputs.os_patch_level }}"
-          if [ "${INPUT}" = "lts" ]; then
-            MANIFEST_REF="common-${VERSION}-lts"
-            PIN_TAG=""
-          else
-            MANIFEST_REF="common-${VERSION}"
-            PIN_TAG="${INPUT}"
-          fi
-          echo "MANIFEST_REF=${MANIFEST_REF}" >> "$GITHUB_ENV"
-          echo "PIN_TAG=${PIN_TAG}" >> "$GITHUB_ENV"
+        run: mkdir -p "${{ env.CCACHE_DIR }}"
 
       - name: Sync GKI kernel source
         run: |
           set -euo pipefail
-          mkdir -p kernel_workspace
-          cd kernel_workspace
-          repo init -u https://android.googlesource.com/kernel/manifest -b "${MANIFEST_REF}" --depth=1
+          mkdir kernel_workspace && cd kernel_workspace
+          repo init -u https://android.googlesource.com/kernel/manifest \
+            -b common-${{ env.VERSION }} --depth=1
           repo sync -c --current-branch --no-clone-bundle --no-tags -j"$(nproc)"
 
-      - name: Pin kernel/common to exact release tag
-        if: ${{ env.PIN_TAG != '' }}
+      - name: Pin kernel/common to requested tag or branch (if not lts)
         working-directory: kernel_workspace/common
         run: |
           set -euo pipefail
-          REMOTE_NAME="$(git remote | head -n1)"
-          [ -n "${REMOTE_NAME}" ]
-          git fetch --depth=1 "${REMOTE_NAME}" "refs/tags/${PIN_TAG}:refs/tags/${PIN_TAG}"
-          git checkout "refs/tags/${PIN_TAG}"
+          REQUESTED="${{ github.event.inputs.os_patch_level }}"
+          if [ "$REQUESTED" != "lts" ] && [ -n "$REQUESTED" ]; then
+            echo "Fetching and checking out kernel/common ref: $REQUESTED"
+            git fetch --depth=1 origin "$REQUESTED" || {
+              echo "::error::Could not find '$REQUESTED' as a tag or branch in kernel/common."
+              exit 1
+            }
+            git checkout FETCH_HEAD
+          else
+            echo "Using rolling lts branch as synced (no pin requested)."
+          fi
 
-      - name: Detect kernel sublevel
-        working-directory: kernel_workspace
+      - name: Ensure generic "ld" exists for host tool builds
         run: |
           set -euo pipefail
-          SUBLEVEL="$(grep -m1 '^SUBLEVEL = ' common/Makefile | awk '{print $3}')"
+          LLD_PATH="$(command -v ld.lld)"
+          if [ -z "$LLD_PATH" ]; then
+            echo "::error::ld.lld not found on PATH after installing llvm/lld"
+            exit 1
+          fi
+          sudo ln -sf "$LLD_PATH" /usr/local/bin/ld
+          ld --version
+
+      - name: Detect kernel sublevel
+        working-directory: kernel_workspace/common
+        run: |
+          SUBLEVEL="$(grep -m1 '^SUBLEVEL = ' Makefile | awk '{print $3}')"
+          echo "Detected SUBLEVEL: $SUBLEVEL"
           echo "SUBLEVEL=${SUBLEVEL}" >> "$GITHUB_ENV"
 
-      - name: Clone SUSFS4KSU
-        if: ${{ github.event.inputs.ksu_variant != 'vanilla' }}
+      - name: Clone SUSFS4KSU (simonpunk upstream)
         working-directory: kernel_workspace
         run: |
           set -euo pipefail
@@ -132,301 +130,142 @@ jobs:
           fi
           echo "SUSFS_COMMIT=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
 
-      # NOTE on SUS_SU: official SUSFS docs state that if your KernelSU
-      # source already ships non-kprobe (manual) hooks — which SukiSU-Ultra/
-      # ReSukiSU's "builtin" tree does — CONFIG_KSU_SUSFS_SUS_SU must stay
-      # DISABLED, since the manual-hook driver doesn't provide the SUS_SU
-      # fd-install glue that config expects. It's intentionally left out
-      # below. (The "undefined symbol: ksu_install_su_fd" build failure is a
-      # separate, unrelated upstream gap — see the auto-heal step further
-      # down for that.)
-      - name: Set SUSFS kernel configs
-        if: ${{ github.event.inputs.ksu_variant != 'vanilla' }}
-        run: |
-          cd kernel_workspace/common/arch/arm64/configs
-          {
-            echo "CONFIG_KSU=y"
-            echo "CONFIG_KSU_SUSFS=y"
-            echo "CONFIG_KSU_SUSFS_SUS_PATH=y"
-            echo "CONFIG_KSU_SUSFS_SUS_MOUNT=y"
-            echo "CONFIG_KSU_SUSFS_SUS_KSTAT=y"
-            echo "CONFIG_KSU_SUSFS_SPOOF_UNAME=y"
-            echo "CONFIG_KSU_SUSFS_ENABLE_LOG=y"
-            echo "CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y"
-            echo "CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y"
-            echo "CONFIG_KSU_SUSFS_OPEN_REDIRECT=y"
-            echo "CONFIG_KSU_SUSFS_SUS_MAP=y"
-          } >> gki_defconfig
-
       - name: Copy SUSFS kernel patches
-        if: ${{ github.event.inputs.ksu_variant != 'vanilla' }}
         run: |
+          set -euo pipefail
           cd kernel_workspace/common
-          cp ../susfs4ksu/kernel_patches/fs/* ./fs/
-          cp ../susfs4ksu/kernel_patches/include/linux/* ./include/linux/
-          cp ../susfs4ksu/kernel_patches/50_add_susfs_in_gki-android12-5.10.patch ./
+          cp -v ../susfs4ksu/kernel_patches/fs/* ./fs/
+          cp -v ../susfs4ksu/kernel_patches/include/linux/* ./include/linux/
+          cp -v ../susfs4ksu/kernel_patches/*.patch ./
 
       - name: Apply android12-5.10 pre-patch compatibility fixes
-        if: ${{ github.event.inputs.ksu_variant != 'vanilla' }}
         working-directory: kernel_workspace/common
         run: |
           set -euo pipefail
           if [ "${SUBLEVEL}" -le "43" ]; then
-            perl -i -pe 's/(int|size_t)\s+this_len\s*=\s*min_t\s*\(\s*\1\s*,/size_t this_len = min_t(size_t,/' fs/proc/base.c
+            if grep -qP '(int|size_t)\s+this_len\s*=\s*min_t\(\s*int\s*,' fs/proc/base.c; then
+              perl -i -pe 's/(int|size_t)\s+this_len\s*=\s*min_t\(\s*int\s*,/size_t this_len = min_t(size_t,/' fs/proc/base.c
+            fi
           fi
           if [ "${SUBLEVEL}" -le "117" ]; then
-            sed -i '\#^[[:space:]]*/\*$#,\#^[[:space:]]*u32 mask = mark->mask & IN_ALL_EVENTS;$#d' fs/notify/fdinfo.c
-            perl -i -pe 's/\bmask,\s*mark->ignored_mask/inotify_mark_user_mask(mark)/g' fs/notify/fdinfo.c
-            perl -i -pe 's/ignored_mask:%x/ignored_mask:0/g' fs/notify/fdinfo.c
+            if grep -q 'u32 mask = mark->mask & IN_ALL_EVENTS;' fs/notify/fdinfo.c; then
+              perl -0777 -i -pe 's/\/\*.*?u32 mask = mark->mask & IN_ALL_EVENTS;\n//s' fs/notify/fdinfo.c
+              perl -i -pe 's/\bmask,\s*mark->ignored_mask/inotify_mark_user_mask(mark)/g' fs/notify/fdinfo.c
+              perl -i -pe 's/ignored_mask:%x/ignored_mask:0/g' fs/notify/fdinfo.c
+            fi
           fi
 
-      - name: Apply SUSFS kernel patch
-        if: ${{ github.event.inputs.ksu_variant != 'vanilla' }}
+      - name: Apply SUSFS kernel patches
         working-directory: kernel_workspace/common
         run: |
           set -euo pipefail
-          patch -p1 --fuzz=3 < 50_add_susfs_in_gki-android12-5.10.patch
+          shopt -s nullglob
+          patches=(*.patch)
+          if [ "${#patches[@]}" -eq 0 ]; then
+            echo "::error::No SUSFS patch files found to apply"
+            exit 1
+          fi
+          IFS=$'\n' sorted=($(sort <<<"${patches[*]}")); unset IFS
+          for p in "${sorted[@]}"; do
+            echo "Applying $p"
+            if ! patch -p1 --fuzz=3 < "$p"; then
+              echo "::error::$p failed to apply cleanly"
+              find . -name "*.rej"
+              exit 1
+            fi
+          done
+
+      - name: Verify SUSFS patch applied cleanly
+        working-directory: kernel_workspace/common
+        run: |
+          set -euo pipefail
+          if ! grep -q "susfs" fs/statfs.c; then
+            echo "::error::SUSFS hooks missing from fs/statfs.c after patching"
+            exit 1
+          fi
 
       - name: Fix SUSFS set_nameidata argument mismatch
-        if: ${{ github.event.inputs.ksu_variant != 'vanilla' }}
         working-directory: kernel_workspace/common
         run: |
           set -euo pipefail
           sed -i 's/set_nameidata(nd, old_dfd, fake_filename, NULL);/set_nameidata(nd, old_dfd, fake_filename);/g' fs/namei.c
 
       - name: Revert android12-5.10 pre-patch compatibility fixes
-        if: ${{ github.event.inputs.ksu_variant != 'vanilla' }}
         working-directory: kernel_workspace/common
         run: |
           set -euo pipefail
           if [ "${SUBLEVEL}" -le "43" ]; then
-            sed -i 's/^size_t this_len = min_t(size_t, count, PAGE_SIZE);$/int this_len = min_t(int, count, PAGE_SIZE);/' fs/proc/base.c
+            if grep -q '^size_t this_len = min_t(size_t, count, PAGE_SIZE);$' fs/proc/base.c; then
+              sed -i 's/^size_t this_len = min_t(size_t, count, PAGE_SIZE);$/int this_len = min_t(int, count, PAGE_SIZE);/' fs/proc/base.c
+            fi
           fi
           if [ "${SUBLEVEL}" -le "117" ]; then
-            perl -i -pe 's#^(\s+if \(inode\) \{)#$1
-            \t\t/*
-            \t\t * IN_ALL_EVENTS represents all of the mask bits
-            \t\t * that we expose to userspace.  There is at
-            \t\t * least one bit (FS_EVENT_ON_CHILD) which is
-            \t\t * used only internally to the kernel.
-            \t\t */
-            \t\tu32 mask = mark->mask & IN_ALL_EVENTS;#m' fs/notify/fdinfo.c
-            perl -i -pe 's/\binotify_mark_user_mask\(mark\)/mask, mark->ignored_mask/g' fs/notify/fdinfo.c
-            perl -i -pe 's/ignored_mask:0/ignored_mask:%x/g' fs/notify/fdinfo.c
+            if grep -q 'inotify_mark_user_mask(mark)' fs/notify/fdinfo.c; then
+              perl -i -pe 's/\binotify_mark_user_mask\(mark\)/mask, mark->ignored_mask/g' fs/notify/fdinfo.c
+              perl -i -pe 's/ignored_mask:0/ignored_mask:%x/g' fs/notify/fdinfo.c
+              perl -i -pe 's/^(\s+if \(inode\) \{)$/$1\n\t\tu32 mask = mark->mask & IN_ALL_EVENTS;/' fs/notify/fdinfo.c
+            fi
           fi
 
-      - name: Apply SUSFS show_pad fix
-        if: ${{ github.event.inputs.ksu_variant != 'vanilla' }}
+      - name: Apply SUSFS show_pad fix (older sublevels only)
         working-directory: kernel_workspace/common
         run: |
-          set -euo pipefail
           if [ "${SUBLEVEL}" -le "209" ]; then
             sed -i -e 's/goto show_pad;/return 0;/' ./fs/proc/task_mmu.c
           fi
 
-      # Five managers selectable via ksu_variant:
-      #   sukisu         -> sukisu-ultra/sukisu-ultra, setup.sh on "main",
-      #                      "builtin" ref = source-embedded tree w/ SUSFS baked in.
-      #   resukisu       -> ReSukiSU/ReSukiSU (re-fork of SukiSU-Ultra, kept
-      #                      in sync more aggressively — good fallback if
-      #                      sukisu's dev branch has a broken commit).
-      #   mambosu        -> RapliVx/KernelSU, setup.sh on "master". Has no
-      #                      "builtin" branch, and since this whole workflow
-      #                      exists to build WITH SUSFS, the generic default
-      #                      falls back to its "susfs-rksu-master" branch
-      #                      (the one that actually wires CONFIG_KSU_SUSFS) —
-      #                      upstream does warn this branch isn't always kept
-      #                      current, so pin ksu_ref to a specific commit on
-      #                      it, or pass ksu_ref: master explicitly if you'd
-      #                      rather have plain root with no SUSFS from this
-      #                      fork.
-      #   kernelsu-next  -> KernelSU-Next/KernelSU-Next, setup.sh on "next".
-      #                      Doesn't use "builtin" either — its ref argument
-      #                      is dev/stable/legacy/vX.Y.Z — so the generic
-      #                      default falls back to "dev" (latest dev branch).
-      #   kowsu          -> KOWX712/KernelSU, a personal fork (Material
-      #                      theming-focused manager) of the standard
-      #                      tiann/KernelSU tree, setup.sh on "main". No
-      #                      "builtin" branch either, so the generic default
-      #                      falls back to "main" (its dev branch). Being a
-      #                      plain tiann/KernelSU-based fork, it likely does
-      #                      NOT expose the CONFIG_KSU_SUSFS Kconfig option at
-      #                      all — see the SUSFS check in "Verify final
-      #                      configs" below, which is a soft warning rather
-      #                      than a hard failure for exactly this reason.
-      # For sukisu/resukisu, "main" is the v4 modular/KPM tree (no KSU-side
-      # SUSFS), "builtin" is the source-embedded tree with SUSFS hooks. A
-      # non-existent ref does NOT fail the build for any of these forks —
-      # setup.sh silently falls back to its own default branch — so we
-      # verify the actual checked-out ref below instead of trusting it.
-      - name: Setup KernelSU manager (SukiSU-Ultra / ReSukiSU / MamboSU / KernelSU-Next / KOWSU)
-        if: ${{ github.event.inputs.ksu_variant != 'vanilla' }}
+      - name: Setup ReSuKisu (main branch)
         working-directory: kernel_workspace/common
         run: |
           set -euo pipefail
-          REQUESTED_REF="${{ github.event.inputs.ksu_ref }}"
-          case "${{ github.event.inputs.ksu_variant }}" in
-            resukisu)
-              REPO_OWNER="ReSukiSU"
-              REPO_NAME="ReSukiSU"
-              KSU_LABEL="ReSukiSU"
-              SETUP_BRANCH="main"
-              REF="${REQUESTED_REF}"
-              ;;
-            mambosu)
-              REPO_OWNER="RapliVx"
-              REPO_NAME="KernelSU"
-              KSU_LABEL="MamboSU"
-              SETUP_BRANCH="master"
-              if [ "${REQUESTED_REF}" = "builtin" ]; then
-                REF="susfs-rksu-master"
-              else
-                REF="${REQUESTED_REF}"
-              fi
-              ;;
-            kernelsu-next)
-              REPO_OWNER="KernelSU-Next"
-              REPO_NAME="KernelSU-Next"
-              KSU_LABEL="KernelSU-Next"
-              SETUP_BRANCH="next"
-              if [ "${REQUESTED_REF}" = "builtin" ]; then
-                REF="dev"
-              else
-                REF="${REQUESTED_REF}"
-              fi
-              ;;
-            kowsu)
-              REPO_OWNER="KOWX712"
-              REPO_NAME="KernelSU"
-              KSU_LABEL="KOWSU"
-              SETUP_BRANCH="main"
-              if [ "${REQUESTED_REF}" = "builtin" ]; then
-                REF="main"
-              else
-                REF="${REQUESTED_REF}"
-              fi
-              ;;
-            *)
-              REPO_OWNER="sukisu-ultra"
-              REPO_NAME="sukisu-ultra"
-              KSU_LABEL="SukiSU"
-              SETUP_BRANCH="main"
-              REF="${REQUESTED_REF}"
-              ;;
-          esac
-          SETUP_URL="https://raw.githubusercontent.com/${REPO_OWNER}/${REPO_NAME}/${SETUP_BRANCH}/kernel/setup.sh"
-          echo "Fetching ${REPO_OWNER}/${REPO_NAME} @ ref '${REF}' (setup.sh from '${SETUP_BRANCH}')"
-          curl -fsSL "${SETUP_URL}" | bash -s "${REF}"
+          curl -LSs "https://raw.githubusercontent.com/ReSukiSU/ReSukiSU/main/kernel/setup.sh" | bash
 
-          ACTUAL_REF="$(git -C KernelSU rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)"
-          ACTUAL_COMMIT="$(git -C KernelSU rev-parse --short HEAD 2>/dev/null || echo unknown)"
-          echo "Checked out: ${ACTUAL_REF} (${ACTUAL_COMMIT})"
-          if [ "${ACTUAL_REF}" != "${REF}" ]; then
-            echo "::warning::Requested ref '${REF}' but HEAD landed on '${ACTUAL_REF}' (${ACTUAL_COMMIT}) — setup.sh may have silently fallen back to the default branch. If you expected SUSFS baked in, double check this ref actually exists on ${REPO_OWNER}/${REPO_NAME}."
-          fi
-          echo "KSU_LABEL=${KSU_LABEL}" >> "$GITHUB_ENV"
-          echo "SUKISU_COMMIT=${ACTUAL_COMMIT}" >> "$GITHUB_ENV"
-
-      # Best-effort auto-heal for known SukiSU-Ultra "builtin" churn.
-      # The builtin branch is an actively-refactored dev branch (feature/ksud
-      # rework in progress), so it occasionally lands commits where a
-      # feature struct registers a .set_handler that was never actually
-      # written (only the _get counterpart exists) — e.g. kernel_umount.c
-      # referencing an undefined kernel_umount_feature_set. When that
-      # specific pattern shows up, fall back to a NULL (read-only) setter so
-      # the build isn't blocked by upstream's in-progress work. This is a
-      # narrow, idempotent check: if upstream later ships the real function,
-      # HAS_DEF becomes >0 and this step does nothing.
-      - name: Auto-heal known SukiSU-Ultra builtin build breaks
-        if: ${{ github.event.inputs.ksu_variant != 'vanilla' }}
+      - name: Neutralize KernelSU pre-config Kbuild hard-check
         working-directory: kernel_workspace/common
         run: |
           set -euo pipefail
-          FILE="drivers/kernelsu/feature/kernel_umount.c"
-          if [ -f "$FILE" ]; then
-            HAS_DEF=$(grep -cE 'kernel_umount_feature_set[[:space:]]*\(' "$FILE" || true)
-            REGISTERED=$(grep -c '\.set_handler[[:space:]]*=[[:space:]]*kernel_umount_feature_set' "$FILE" || true)
-            if [ "${REGISTERED:-0}" -ge 1 ] && [ "${HAS_DEF:-0}" -le "${REGISTERED:-0}" ]; then
-              echo "::warning::kernel_umount_feature_set is registered but not defined (known SukiSU-Ultra builtin WIP) — falling back to a read-only handler"
-              sed -i 's/\.set_handler[[:space:]]*=[[:space:]]*kernel_umount_feature_set,/.set_handler = NULL,/' "$FILE"
-            fi
+          KBUILD="drivers/kernelsu/Kbuild"
+          if [ -f "$KBUILD" ] && grep -q '\$(error "KernelSU requires' "$KBUILD"; then
+            sed -i '/\$(error "KernelSU requires/d' "$KBUILD"
           fi
 
-      # Auto-heal: "undefined symbol: ksu_install_su_fd" @ fs/exec.c.
-      # This is a genuine upstream gap in SukiSU-Ultra/ReSukiSU's "builtin"
-      # dev branch: the SUSFS kernel-side patch calls this SUS_SU fd-install
-      # hook unconditionally from fs/exec.c, but this dev commit's driver
-      # source never shipped a matching definition anywhere in the tree.
-      # Rather than guess the function's signature, we look for its
-      # prototype/declaration (wherever it's forward-declared so the call
-      # even type-checks) and copy its exact return type + parameter list to
-      # synthesize a no-op definition, appended directly into fs/exec.c
-      # itself (so it always sees whatever types the prototype needs,
-      # without header/include guesswork). This only disables SUSFS's
-      # SUS_SU fd-hiding for su exec in this build — it does nothing if
-      # upstream already ships a real definition (DEF_COUNT check below).
-      - name: Auto-heal missing ksu_install_su_fd definition
-        if: ${{ github.event.inputs.ksu_variant != 'vanilla' }}
-        working-directory: kernel_workspace/common
+      - name: Enable KernelSU + SUSFS config
         run: |
-          set -euo pipefail
-          if ! grep -q 'ksu_install_su_fd' fs/exec.c 2>/dev/null; then
-            echo "fs/exec.c does not reference ksu_install_su_fd — nothing to heal."
-            exit 0
-          fi
-          DEF_COUNT=$(grep -rlE '\bksu_install_su_fd\s*\(' --include='*.c' --include='*.h' . 2>/dev/null | grep -vc '^\./fs/exec\.c$' || true)
-          if [ "${DEF_COUNT:-0}" -ge 1 ]; then
-            echo "ksu_install_su_fd is resolvable elsewhere in the tree — nothing to heal."
-            exit 0
-          fi
-          echo "::warning::fs/exec.c calls ksu_install_su_fd() with no definition anywhere in the tree (known SukiSU-Ultra/ReSukiSU builtin dev-branch gap). Synthesizing a no-op definition directly in fs/exec.c so the build can complete; SUS_SU fd-hiding will be inert for this build."
-          PROTO_LINE=$(grep -rhoE '(extern[[:space:]]+)?[A-Za-z_][A-Za-z0-9_ \*]*\bksu_install_su_fd[[:space:]]*\([^;{]*\)[[:space:]]*;' \
-            --include='*.c' --include='*.h' . 2>/dev/null | grep -v '^[[:space:]]*$' | head -n1 || true)
-          if [ -z "${PROTO_LINE}" ]; then
-            echo "::error::ksu_install_su_fd is called in fs/exec.c but no prototype/declaration exists anywhere in the tree either — cannot safely synthesize a matching definition. Try ksu_variant: resukisu, or pin an older ksu_ref commit instead of 'builtin'."
-            exit 1
-          fi
-          SIG=$(echo "${PROTO_LINE}" | sed -E 's/^[[:space:]]*extern[[:space:]]+//; s/;[[:space:]]*$//')
-          if echo "${SIG}" | grep -qE '^[[:space:]]*void\b'; then
-            BODY="{ }"
-          else
-            BODY="{ return 0; }"
-          fi
+          cd kernel_workspace/common/arch/arm64/configs
           {
-            echo ""
-            echo "/* Auto-healed stub (see 'Auto-heal missing ksu_install_su_fd"
-            echo " * definition' CI step): this SukiSU-Ultra/ReSukiSU builtin"
-            echo " * commit calls this SUSFS SUS_SU hook without shipping a"
-            echo " * definition. No-op keeps the build green; SUS_SU fd-hiding"
-            echo " * is inactive until upstream ships the real function. */"
-            echo "${SIG} ${BODY}"
-          } >> fs/exec.c
+            echo "CONFIG_KSU=y"
+            echo "CONFIG_KSU_SUSFS=y"
+            echo "CONFIG_KSU_SUSFS_HAS_MAGIC_MOUNT=y"
+            echo "CONFIG_KSU_SUSFS_SUS_PATH=y"
+            echo "CONFIG_KSU_SUSFS_SUS_MOUNT=y"
+            echo "CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT=y"
+            echo "CONFIG_KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT=y"
+            echo "CONFIG_KSU_SUSFS_SUS_KSTAT=y"
+            echo "CONFIG_KSU_SUSFS_SUS_OVERLAYFS=n"
+            echo "CONFIG_KSU_SUSFS_TRY_UMOUNT=y"
+            echo "CONFIG_KSU_SUSFS_AUTO_ADD_TRY_UMOUNT_FOR_BIND_MOUNT=y"
+            echo "CONFIG_KSU_SUSFS_SPOOF_UNAME=y"
+            echo "CONFIG_KSU_SUSFS_ENABLE_LOG=y"
+            echo "CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y"
+            echo "CONFIG_KSU_SUSFS_SPOOF_PROC_CMDLINE=y"
+            echo "CONFIG_KSU_SUSFS_OPEN_REDIRECT=y"
+            echo "# CONFIG_KSU_SUSFS_SUS_SU is not set"
+          } >> gki_defconfig
 
-      # NOTE: the old "Fix KernelSU-Next static patch" step is intentionally
-      # removed. That patch (from WildKernels/GKI_KernelSU_SUSFS) targeted a
-      # static-assertion bug specific to the pershoot/KernelSU-Next fork and
-      # its KernelSU-Next/ directory layout — it doesn't apply to SukiSU-Ultra
-      # and there's nothing to replace it with unless a build error surfaces.
-
-      - name: Install Baseband Guard
+      - name: Install Baseband Guard (BBG)
         if: ${{ github.event.inputs.enable_bbg == 'true' }}
         working-directory: kernel_workspace
         run: |
           set -euo pipefail
-          wget -qO- https://github.com/vc-teahouse/Baseband-guard/raw/main/setup.sh | bash
+          wget -O- https://github.com/vc-teahouse/Baseband-guard/raw/main/setup.sh | bash
 
       - name: Configure Baseband Guard LSM
         if: ${{ github.event.inputs.enable_bbg == 'true' }}
         working-directory: kernel_workspace
         run: |
-           set -euo pipefail
-           sed -i '/^config LSM$/,/^help$/{ /^[[:space:]]*default/ { /baseband_guard/! s/selinux/selinux,baseband_guard/ } }' common/security/Kconfig
-
-      - name: Enable BBG config
-        if: ${{ github.event.inputs.enable_bbg == 'true' }}
-        run: |
-          cd kernel_workspace/common/arch/arm64/configs
-          echo "CONFIG_BBG=y" >> gki_defconfig
+          set -euo pipefail
+          sed -i '/^config LSM$/,/^help$/{ /^[[:space:]]*default/ { /baseband_guard/! s/selinux/selinux,baseband_guard/ } }' common/security/Kconfig
+          echo "CONFIG_BBG=y" >> common/arch/arm64/configs/gki_defconfig
 
       - name: Apply BBRv3 backport
         working-directory: kernel_workspace/common
@@ -434,15 +273,9 @@ jobs:
           set -euo pipefail
           git clone --depth=1 https://github.com/WildKernels/kernel_patches.git /tmp/wildpatches
           BBRV3_PATCH="/tmp/wildpatches/common/bbrv3/0001-net-tcp-backport-BBRv3-to-android12-5.10.patch"
-          BBR_CONG_NAME="bbr"
-          BBRV3_PATCH_APPLIED="false"
-          if [ -f "$BBRV3_PATCH" ] && patch -p1 < "$BBRV3_PATCH"; then
-            BBRV3_PATCH_APPLIED="true"
-            DETECTED="$(grep -rhoE '\.name\s*=\s*"[a-zA-Z0-9_]+"' net/ipv4/tcp_bbr*.c 2>/dev/null | grep -oE '"[a-zA-Z0-9_]+"' | tr -d '"' | head -n1 || true)"
-            [ -n "$DETECTED" ] && BBR_CONG_NAME="$DETECTED"
+          if [ -f "$BBRV3_PATCH" ]; then
+            patch -p1 < "$BBRV3_PATCH" || echo "::warning::BBRv3 patch had rejects"
           fi
-          echo "BBR_CONG_NAME=${BBR_CONG_NAME}" >> "$GITHUB_ENV"
-          echo "BBRV3_PATCH_APPLIED=${BBRV3_PATCH_APPLIED}" >> "$GITHUB_ENV"
 
       - name: Set networking / TCP congestion configs
         run: |
@@ -450,17 +283,94 @@ jobs:
           {
             echo "CONFIG_TCP_CONG_ADVANCED=y"
             echo "CONFIG_TCP_CONG_BBR=y"
-            echo "CONFIG_TCP_CONG_CUBIC=y"
-            echo "CONFIG_TCP_CONG_BIC=y"
-            echo "CONFIG_TCP_CONG_WESTWOOD=y"
-            echo "CONFIG_TCP_CONG_HTCP=y"
-            if [ "${BBRV3_PATCH_APPLIED}" = "true" ]; then
-              echo "CONFIG_TCP_CONG_BBR3=y"
-            fi
-            echo "CONFIG_DEFAULT_TCP_CONG=${BBR_CONG_NAME}"
+            echo "CONFIG_TCP_CONG_BBR3=y"
+            echo 'CONFIG_DEFAULT_TCP_CONG="bbr"'
             echo "CONFIG_NET_SCH_FQ=y"
             echo "CONFIG_NET_SCH_FQ_CODEL=y"
             echo "CONFIG_NET_SCH_CAKE=y"
+          } >> gki_defconfig
+
+      - name: Apply DroidSpaces kABI-safe patches
+        working-directory: kernel_workspace/common
+        run: |
+          set -euo pipefail
+          BASE="https://raw.githubusercontent.com/ravindu644/Droidspaces-OSS/main/Documentation/resources/kernel-patches/GKI/below-kernel-6.12"
+          curl -fLSs -o /tmp/001-sysvipc-kabi.patch "${BASE}/001.GKI-below-6.12-fix_sysvipc_kabi_6_7_8.patch"
+          patch -p1 < /tmp/001-sysvipc-kabi.patch
+          curl -fLSs -o /tmp/002-posix-mqueue-kabi.patch "${BASE}/002.5.10_or_lower_use_android_abi_padding_for_posix_mqueue.patch"
+          patch -p1 < /tmp/002-posix-mqueue-kabi.patch
+
+      - name: Set DroidSpaces GKI-exclusive kernel configs
+        run: |
+          cd kernel_workspace/common/arch/arm64/configs
+          {
+            echo "CONFIG_SYSVIPC=y"
+            echo "CONFIG_POSIX_MQUEUE=y"
+            echo "CONFIG_IPC_NS=y"
+            echo "CONFIG_PID_NS=y"
+            echo "CONFIG_UTS_NS=y"
+            echo "CONFIG_NET_NS=y"
+            echo "CONFIG_NAMESPACES=y"
+            echo "CONFIG_DEVTMPFS=y"
+            echo "CONFIG_NETFILTER_XT_MATCH_ADDRTYPE=y"
+            echo "CONFIG_USER_NS=y"
+            echo "CONFIG_CGROUPS=y"
+            echo "CONFIG_CGROUP_DEVICE=y"
+            echo "CONFIG_CGROUP_PIDS=y"
+            echo "CONFIG_CGROUP_FREEZER=y"
+            echo "CONFIG_MEMCG=y"
+            echo "CONFIG_OVERLAY_FS=y"
+            echo "CONFIG_VETH=y"
+            echo "CONFIG_BRIDGE=y"
+            echo "CONFIG_TMPFS_POSIX_ACL=y"
+            echo "CONFIG_TMPFS_XATTR=y"
+          } >> gki_defconfig
+
+      - name: Set Clean ConfigFS USB Gadget Stack (Removed Conflicts)
+        run: |
+          cd kernel_workspace/common/arch/arm64/configs
+          {
+            echo "CONFIG_USB_GADGET=y"
+            echo "CONFIG_USB_CONFIGFS=y"
+            echo "CONFIG_USB_CONFIGFS_UEVENT=y"
+            echo "CONFIG_USB_CONFIGFS_F_FS=y"
+            echo "CONFIG_USB_CONFIGFS_F_MTP=y"
+            echo "CONFIG_USB_CONFIGFS_F_PTP=y"
+            echo "CONFIG_USB_CONFIGFS_F_ACC=y"
+            echo "CONFIG_USB_CONFIGFS_F_AUDIO_SRC=y"
+            echo "CONFIG_USB_CONFIGFS_F_MIDI=y"
+            echo "CONFIG_USB_CONFIGFS_F_HID=y"
+            echo "CONFIG_USB_CONFIGFS_RNDIS=y"
+            echo "CONFIG_USB_CONFIGFS_MASS_STORAGE=y"
+          } >> gki_defconfig
+
+      - name: Set rtl8xxxu Wi-Fi driver as Loadable Modules (=m)
+        run: |
+          cd kernel_workspace/common/arch/arm64/configs
+          {
+            echo "CONFIG_RFKILL=m"
+            echo "CONFIG_CFG80211=m"
+            echo "CONFIG_MAC80211=m"
+            echo "CONFIG_WLAN=y"
+            echo "CONFIG_WLAN_VENDOR_REALTEK=y"
+            echo "CONFIG_RTL8XXXU=m"
+          } >> gki_defconfig
+
+      - name: Set Full CAN Bus Subsystem Support
+        run: |
+          cd kernel_workspace/common/arch/arm64/configs
+          {
+            echo "CONFIG_CAN=y"
+            echo "CONFIG_CAN_RAW=y"
+            echo "CONFIG_CAN_BCM=y"
+            echo "CONFIG_CAN_GW=y"
+            echo "CONFIG_CAN_DEV=y"
+            echo "CONFIG_CAN_CALC_BITTIMING=y"
+            echo "CONFIG_CAN_VCAN=m"
+            echo "CONFIG_CAN_SLCAN=m"
+            echo "CONFIG_CAN_USB=y"
+            echo "CONFIG_CAN_GS_USB=m"
+            echo "CONFIG_CAN_MCP251X=m"
           } >> gki_defconfig
 
       - name: Apply NTSync patches
@@ -468,245 +378,79 @@ jobs:
         run: |
           set -euo pipefail
           if [ "${SUBLEVEL}" -le "208" ]; then
-            curl -fsSL -o /tmp/0003-lockdep-assert-none-held.patch \
+            curl -LSs -o /tmp/0003-lockdep-assert-none-held.patch \
               https://raw.githubusercontent.com/WildKernels/GKI_KernelSU_SUSFS/main/.github/actions/ntsync/patches/0003-lockdep-assert-none-held.patch
             patch -p1 -N < /tmp/0003-lockdep-assert-none-held.patch || true
           fi
-          curl -fsSL -o /tmp/ntsync_compat_android12-5.10.patch \
+          curl -LSs -o /tmp/ntsync_compat_android12-5.10.patch \
             https://raw.githubusercontent.com/WildKernels/kernel_patches/main/common/ntsync/ntsync_compat_android12-5.10.patch
           patch -p1 < /tmp/ntsync_compat_android12-5.10.patch || true
-          curl -fsSL -o /tmp/ntsync_base.patch \
+          curl -LSs -o /tmp/ntsync_base.patch \
             https://raw.githubusercontent.com/WildKernels/kernel_patches/main/common/ntsync/ntsync_base.patch
           patch -p1 < /tmp/ntsync_base.patch || true
           echo "CONFIG_NTSYNC=y" >> arch/arm64/configs/gki_defconfig
 
-      - name: Apply Droidspaces kABI-safe patches
-        working-directory: kernel_workspace/common
-        run: |
-          set -euo pipefail
-          DROIDSPACES_KABI_OK="true"
-          curl -fsSL -o /tmp/droidspaces_sysvipc_kabi.patch \
-            https://raw.githubusercontent.com/ravindu644/Droidspaces-OSS/main/Documentation/resources/kernel-patches/GKI/below-kernel-6.12/001.GKI-below-6.12-fix_sysvipc_kabi_6_7_8.patch
-          if ! patch -p1 < /tmp/droidspaces_sysvipc_kabi.patch; then
-            DROIDSPACES_KABI_OK="false"
-          fi
-          curl -fsSL -o /tmp/droidspaces_posix_mqueue_kabi.patch \
-            https://raw.githubusercontent.com/ravindu644/Droidspaces-OSS/main/Documentation/resources/kernel-patches/GKI/below-kernel-6.12/002.5.10_or_lower_use_android_abi_padding_for_posix_mqueue.patch
-          if ! patch -p1 < /tmp/droidspaces_posix_mqueue_kabi.patch; then
-            DROIDSPACES_KABI_OK="false"
-          fi
-          echo "DROIDSPACES_KABI_OK=${DROIDSPACES_KABI_OK}" >> "$GITHUB_ENV"
-
-      - name: Set Droidspaces configs
+      - name: Set LTO mode
         run: |
           cd kernel_workspace/common/arch/arm64/configs
-          if [ "${DROIDSPACES_KABI_OK}" = "true" ]; then
-            {
-              echo "CONFIG_SYSVIPC=y"
-              echo "CONFIG_POSIX_MQUEUE=y"
-              echo "CONFIG_IPC_NS=y"
-            } >> gki_defconfig
-          fi
-          {
-            echo "CONFIG_NAMESPACES=y"
-            echo "CONFIG_NET_NS=y"
-            echo "CONFIG_CGROUPS=y"
-            echo "CONFIG_PID_NS=y"
-            echo "CONFIG_USER_NS=y"
-            echo "CONFIG_DEVTMPFS=y"
-            echo "CONFIG_NETFILTER_XT_MATCH_ADDRTYPE=y"
-            echo "CONFIG_NETFILTER_XT_TARGET_REJECT=y"
-            echo "CONFIG_NETFILTER_XT_TARGET_LOG=y"
-            echo "CONFIG_NETFILTER_XT_MATCH_RECENT=y"
-            echo "CONFIG_IP_SET=y"
-            echo "CONFIG_IP_SET_HASH_IP=y"
-            echo "CONFIG_IP_SET_HASH_NET=y"
-            echo "CONFIG_NETFILTER_XT_SET=y"
-            echo "CONFIG_TMPFS_POSIX_ACL=y"
-            echo "CONFIG_TMPFS_XATTR=y"
-          } >> gki_defconfig
-
-      - name: Set full USB HID gadget configs
-        if: ${{ github.event.inputs.enable_hid == 'true' }}
-        run: |
-          cd kernel_workspace/common/arch/arm64/configs
-          # Note: F_UAC1 and F_UAC1_LEGACY are two separate audio-source
-          # function drivers (new vs legacy ALSA path). Some GKI Kconfig
-          # versions treat them as a mutually exclusive choice — if the
-          # build fails on this pair, drop F_UAC1_LEGACY and keep F_UAC1.
-          {
-            echo "CONFIG_USB_GADGET=y"
-            echo "CONFIG_USB_LIBCOMPOSITE=y"
-            echo "CONFIG_USB_CONFIGFS=y"
-            echo "CONFIG_USB_CONFIGFS_SERIAL=y"
-            echo "CONFIG_USB_CONFIGFS_ACM=y"
-            echo "CONFIG_USB_CONFIGFS_OBEX=y"
-            echo "CONFIG_USB_CONFIGFS_NCM=y"
-            echo "CONFIG_USB_CONFIGFS_ECM=y"
-            echo "CONFIG_USB_CONFIGFS_ECM_SUBSET=y"
-            echo "CONFIG_USB_CONFIGFS_RNDIS=y"
-            echo "CONFIG_USB_CONFIGFS_EEM=y"
-            echo "CONFIG_USB_CONFIGFS_MASS_STORAGE=y"
-            echo "CONFIG_USB_CONFIGFS_F_HID=y"
-            echo "CONFIG_USB_CONFIGFS_F_FS=y"
-            echo "CONFIG_USB_CONFIGFS_UEVENT=y"
-            echo "CONFIG_USB_CONFIGFS_F_LB_SS=y"
-            echo "CONFIG_USB_CONFIGFS_F_PRINTER=y"
-            echo "CONFIG_USB_CONFIGFS_F_UAC1=y"
-            echo "CONFIG_USB_CONFIGFS_F_UAC1_LEGACY=y"
-            echo "CONFIG_USB_ACM=y"
-            echo "CONFIG_HIDRAW=y"
-            echo "CONFIG_UHID=y"
-          } >> gki_defconfig
-
-      - name: Set CAN bus configs
-        if: ${{ github.event.inputs.enable_can == 'true' }}
-        run: |
-          cd kernel_workspace/common/arch/arm64/configs
-          {
-            # Core CAN subsystem + network layer protocols
-            echo "CONFIG_CAN=y"
-            echo "CONFIG_CAN_RAW=y"
-            echo "CONFIG_CAN_BCM=y"
-            echo "CONFIG_CAN_GW=y"
-            echo "CONFIG_CAN_J1939=y"
-            echo "CONFIG_CAN_ISOTP=y"
-            # Virtual + serial-line CAN so CARsenal/candump work even without
-            # a physical adapter attached (vcan0, slcan)
-            echo "CONFIG_CAN_VCAN=y"
-            echo "CONFIG_CAN_VXCAN=y"
-            echo "CONFIG_CAN_SLCAN=y"
-            echo "CONFIG_CAN_DEV=y"
-            echo "CONFIG_CAN_CALC_BITTIMING=y"
-            # Common USB-CAN adapter drivers (Kvaser Leaf, PEAK PCAN-USB,
-            # EMS CPC-USB, 8devices USB2CAN, Geschwister Schneider/candleLight,
-            # Microchip usb251xb-style CAN, ESD USB/2)
-            echo "CONFIG_CAN_KVASER_USB=y"
-            echo "CONFIG_CAN_PEAK_USB=y"
-            echo "CONFIG_CAN_EMS_USB=y"
-            echo "CONFIG_CAN_8DEV_USB=y"
-            echo "CONFIG_CAN_GS_USB=y"
-            echo "CONFIG_CAN_ESD_USB2=y"
-            echo "CONFIG_CAN_MCBA_USB=y"
-            echo "CONFIG_CAN_UCAN=y"
-          } >> gki_defconfig
-
-      - name: Set IIO / PCI endpoint configfs configs
-        run: |
-          cd kernel_workspace/common/arch/arm64/configs
-          {
-            # IIO_CONFIGFS needs the IIO core enabled first
-            echo "CONFIG_IIO=y"
-            echo "CONFIG_IIO_CONFIGFS=y"
-            # PCI_ENDPOINT_CONFIGFS needs a PCI endpoint controller framework;
-            # most phone SoCs don't expose one, so this may stay "Not set"
-            # even after this even if requested — that's a hardware/config
-            # dependency limit, not a mistake in this step.
-            echo "CONFIG_PCI_ENDPOINT=y"
-            echo "CONFIG_PCI_ENDPOINT_CONFIGFS=y"
-          } >> gki_defconfig
-
-      - name: Apply custom kernel branding
-        working-directory: kernel_workspace/common
-        run: |
-          set -euo pipefail
-          mv scripts/setlocalversion scripts/setlocalversion.orig
-          chmod +x scripts/setlocalversion.orig
-          cat > scripts/setlocalversion << EOF
-          #!/bin/sh
-          printf -- '-BLAZE-STABLE'
-
-          EOF
-          chmod +x scripts/setlocalversion
-
-      - name: Disable strict defconfig verification
-        working-directory: kernel_workspace
-        run: sed -i 's/check_defconfig//' ./common/build.config.gki
-
-      - name: Disable strict GKI modules list verification
-        working-directory: kernel_workspace/common
-        run: |
-          set -euo pipefail
-          # We've added new =m modules that aren't in the upstream
-          # android/gki_aarch64_modules allow-list. The GKI build compares the
-          # generated modules.order against the file pointed to by MODULES_ORDER
-          # (usually android/gki_aarch64_modules) and fails with "modules list
-          # out of date" on any mismatch. Blank MODULES_ORDER in every
-          # build.config* so build.sh skips that diff check entirely. This only
-          # disables the build-time bookkeeping comparison — it does not change
-          # which modules get compiled, built into the Image, or loaded at runtime,
-          # so it carries no bootloop risk on its own.
-          grep -rl '^MODULES_ORDER=' build.config* 2>/dev/null | xargs -r sed -i 's/^MODULES_ORDER=.*/MODULES_ORDER=/' || true
-          # Also cover MODULES_LIST in case a downstream config uses that name instead.
-          grep -rl '^MODULES_LIST=' build.config* 2>/dev/null | xargs -r sed -i 's/^MODULES_LIST=.*/MODULES_LIST=/' || true
-
-      - name: Build kernel
-        working-directory: kernel_workspace
-        run: |
-          set -euo pipefail
-          export KBUILD_BUILD_USER="builder"
-          export KBUILD_BUILD_HOST="ci"
-          LTO=thin BUILD_CONFIG=common/build.config.gki.aarch64 USE_CCACHE=1 CCACHE_DIR="${CCACHE_DIR}" build/build.sh -j"$(nproc)"
-
-      - name: Verify final configs
-        working-directory: kernel_workspace
-        run: |
-          set -euo pipefail
-          CFG=$(find out -name ".config" | head -n1)
-          [ -n "$CFG" ]
-          # CONFIG_KSU is required for every manager except vanilla (which
-          # intentionally has no root manager baked in at all — root is
-          # applied afterward via Magisk or another manager on the built
-          # boot image). CONFIG_KSU_SUSFS is checked separately as a soft
-          # warning below, since not every manager fork's Kconfig actually
-          # exposes that option (e.g. kowsu, or mambosu if built off plain
-          # "master" instead of its susfs-rksu-master branch) — the kernel
-          # is still a perfectly valid rooted build without it, just
-          # without SUSFS.
-          for SYM in CONFIG_NAMESPACES CONFIG_NET_NS CONFIG_PID_NS CONFIG_CGROUPS CONFIG_USER_NS CONFIG_USB_CONFIGFS_F_HID CONFIG_USB_CONFIGFS CONFIG_USB_GADGET; do
-            grep -q "^${SYM}=y$" "$CFG"
-          done
-          if [ "${{ github.event.inputs.ksu_variant }}" != "vanilla" ]; then
-            grep -q "^CONFIG_KSU=y$" "$CFG"
-            grep -q "^CONFIG_KSU_SUSFS=y$" "$CFG" || echo "::warning::CONFIG_KSU_SUSFS did not end up enabled in the final .config — the selected ksu_variant/ksu_ref likely doesn't expose SUSFS support in its Kconfig. The kernel still built with plain root; SUSFS hiding just won't be active."
-          fi
-          if [ "${{ github.event.inputs.enable_hid }}" = "true" ]; then
-            for SYM in CONFIG_USB_CONFIGFS_F_LB_SS CONFIG_USB_CONFIGFS_F_PRINTER CONFIG_USB_CONFIGFS_F_UAC1; do
-              grep -q "^${SYM}=y$" "$CFG" || echo "::warning::${SYM} did not end up enabled in the final .config"
-            done
-          fi
-          if [ "${{ github.event.inputs.enable_can }}" = "true" ]; then
-            grep -q "^CONFIG_CAN=y$" "$CFG"
-          fi
-
-      - name: Locate built Image
-        working-directory: kernel_workspace
-        run: |
-          set -euo pipefail
-          IMG=$(find out -path "*dist/Image" | head -n1)
-          if [ -z "$IMG" ]; then
-            IMG=$(find out -name "Image" | head -n1)
-          fi
-          [ -n "$IMG" ]
-          echo "IMG_PATH=kernel_workspace/${IMG}" >> "$GITHUB_ENV"
-
-      - name: Package AnyKernel3
-        run: |
-          set -euo pipefail
-          git clone --depth=1 https://github.com/WildKernels/AnyKernel3.git -b gki-2.0 ak3
-          cp "${{ env.IMG_PATH }}" ak3/Image
-          cd ak3
-          if [ "${{ github.event.inputs.ksu_variant }}" = "vanilla" ]; then
-            SUFFIX="vanilla"
+          sed -i '/CONFIG_LTO/d' gki_defconfig
+          if [ "${{ github.event.inputs.kernel_lto }}" = "none" ]; then
+            echo "CONFIG_LTO_NONE=y" >> gki_defconfig
           else
-            COMMIT_SHORT="${SUSFS_COMMIT:-none}"
-            SUFFIX="susfs${COMMIT_SHORT:0:8}"
+            echo "CONFIG_LTO_CLANG_THIN=y" >> gki_defconfig
           fi
-          zip -r9 -q "../${{ github.event.inputs.device_name }}-Blaze-android12-5.10-${SUFFIX}.zip" . -x ".git*"
 
-      - name: Upload artifacts
+      - name: Build kernel & modules
+        working-directory: kernel_workspace/common
+        run: |
+          set -euo pipefail
+          export ARCH=arm64
+          export CROSS_COMPILE=aarch64-linux-gnu-
+          export CCACHE_DIR="${{ env.CCACHE_DIR }}"
+          export PATH="/usr/lib/ccache:$PATH"
+          export CC="ccache clang"
+          export LLVM=1
+          export LLVM_IAS=1
+
+          make -j"$(nproc)" O="$(pwd)/out" ARCH=arm64 CC="$CC" LLVM=1 LLVM_IAS=1 gki_defconfig
+          make -j"$(nproc)" O="$(pwd)/out" ARCH=arm64 CC="$CC" LLVM=1 LLVM_IAS=1
+
+      - name: Verify build output
+        working-directory: kernel_workspace/common/out
+        run: |
+          set -euo pipefail
+          IMAGE_PATH=""
+          for candidate in arch/arm64/boot/Image arch/arm64/boot/Image.gz; do
+            if [ -f "$candidate" ]; then
+              IMAGE_PATH="$candidate"
+              break
+            fi
+          done
+          if [ -z "$IMAGE_PATH" ]; then
+            echo "::error::No kernel Image found!"
+            exit 1
+          fi
+          echo "IMAGE_PATH=${IMAGE_PATH}" >> "$GITHUB_ENV"
+
+      - name: Package AnyKernel3 Flashable Zip with Compiled Modules
+        run: |
+          set -euo pipefail
+          git clone --depth=1 https://github.com/Kernel-SU/AnyKernel3.git /tmp/AnyKernel3
+          rm -rf /tmp/AnyKernel3/.git
+          cp "kernel_workspace/common/out/${IMAGE_PATH}" /tmp/AnyKernel3/Image
+          
+          # Copy all generated .ko modules for Realtek and CAN drivers
+          mkdir -p /tmp/AnyKernel3/modules/system/lib/modules
+          find kernel_workspace/common/out/ -name "*.ko" -exec cp {} /tmp/AnyKernel3/modules/system/lib/modules/ \; || true
+          
+          cd /tmp/AnyKernel3
+          zip -r9 "${GITHUB_WORKSPACE}/${{ github.event.inputs.device_name }}-kernel.zip" . -x ".git*"
+
+      - name: Upload build artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ github.event.inputs.device_name }}-build
-          path: "*.zip"
-          retention-days: 14
+          name: ${{ github.event.inputs.device_name }}-${{ env.VERSION }}
+          path: |
+            ${{ github.workspace }}/*.zip
+            kernel_workspace/common/out/arch/arm64/boot/Image*
+          if-no-files-found: error
