@@ -11,6 +11,10 @@ on:
         description: "SUSFS commit hash on gki-android12-5.10 branch. Pinned by default to a known-working commit."
         required: false
         default: "ec785f47d49f7b3871ca9356f450411020af7017"
+      resukisu_ref:
+        description: "ReSukiSU ref (tag/commit/branch) to check out. DO NOT leave as 'main' for a real build — main is a rolling branch and can drift out of sync with the pinned susfs_commit above, which is what caused the last bootloop. Set this to whatever tag/commit you last confirmed booted, or to a specific release tag from https://github.com/ReSukiSU/ReSukiSU/tags."
+        required: true
+        default: "main"
       device_name:
         description: "Optional label for artifact naming"
         required: false
@@ -214,11 +218,16 @@ jobs:
             sed -i -e 's/goto show_pad;/return 0;/' ./fs/proc/task_mmu.c
           fi
 
-      - name: Setup ReSuKisu (main branch)
+      - name: Setup ReSuKisu (pinned ref)
         working-directory: kernel_workspace/common
         run: |
           set -euo pipefail
-          curl -LSs "https://raw.githubusercontent.com/ReSukiSU/ReSukiSU/main/kernel/setup.sh" | bash
+          REF="${{ github.event.inputs.resukisu_ref }}"
+          if [ "$REF" = "main" ]; then
+            echo "::warning::resukisu_ref is set to 'main' (rolling branch). This is the exact combination that caused the last bootloop, since it can silently drift out of sync with the pinned susfs_commit. Set resukisu_ref to a fixed tag/commit for reproducible builds."
+          fi
+          echo "Using ReSukiSU ref: $REF"
+          curl -LSs "https://raw.githubusercontent.com/ReSukiSU/ReSukiSU/main/kernel/setup.sh" | bash -s "$REF"
 
       - name: Neutralize KernelSU pre-config Kbuild hard-check
         working-directory: kernel_workspace/common
@@ -241,7 +250,7 @@ jobs:
             echo "CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT=y"
             echo "CONFIG_KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT=y"
             echo "CONFIG_KSU_SUSFS_SUS_KSTAT=y"
-            echo "CONFIG_KSU_SUSFS_SUS_OVERLAYFS=n"
+            echo "# CONFIG_KSU_SUSFS_SUS_OVERLAYFS is not set"
             echo "CONFIG_KSU_SUSFS_TRY_UMOUNT=y"
             echo "CONFIG_KSU_SUSFS_AUTO_ADD_TRY_UMOUNT_FOR_BIND_MOUNT=y"
             echo "CONFIG_KSU_SUSFS_SPOOF_UNAME=y"
@@ -344,19 +353,19 @@ jobs:
             echo "CONFIG_USB_CONFIGFS_MASS_STORAGE=y"
           } >> gki_defconfig
 
-      - name: Set rtl8xxxu Wi-Fi driver as Loadable Modules (=m)
+      - name: Set rtl8xxxu Wi-Fi driver as built-in (=y)
         run: |
           cd kernel_workspace/common/arch/arm64/configs
           {
-            echo "CONFIG_RFKILL=m"
-            echo "CONFIG_CFG80211=m"
-            echo "CONFIG_MAC80211=m"
+            echo "CONFIG_RFKILL=y"
+            echo "CONFIG_CFG80211=y"
+            echo "CONFIG_MAC80211=y"
             echo "CONFIG_WLAN=y"
             echo "CONFIG_WLAN_VENDOR_REALTEK=y"
-            echo "CONFIG_RTL8XXXU=m"
+            echo "CONFIG_RTL8XXXU=y"
           } >> gki_defconfig
 
-      - name: Set Full CAN Bus Subsystem Support
+      - name: Set Full CAN Bus Subsystem Support (built-in)
         run: |
           cd kernel_workspace/common/arch/arm64/configs
           {
@@ -366,11 +375,11 @@ jobs:
             echo "CONFIG_CAN_GW=y"
             echo "CONFIG_CAN_DEV=y"
             echo "CONFIG_CAN_CALC_BITTIMING=y"
-            echo "CONFIG_CAN_VCAN=m"
-            echo "CONFIG_CAN_SLCAN=m"
+            echo "CONFIG_CAN_VCAN=y"
+            echo "CONFIG_CAN_SLCAN=y"
             echo "CONFIG_CAN_USB=y"
-            echo "CONFIG_CAN_GS_USB=m"
-            echo "CONFIG_CAN_MCP251X=m"
+            echo "CONFIG_CAN_GS_USB=y"
+            echo "CONFIG_CAN_MCP251X=y"
           } >> gki_defconfig
 
       - name: Apply NTSync patches
@@ -432,17 +441,13 @@ jobs:
           fi
           echo "IMAGE_PATH=${IMAGE_PATH}" >> "$GITHUB_ENV"
 
-      - name: Package AnyKernel3 Flashable Zip with Compiled Modules
+      - name: Package AnyKernel3 Flashable Zip (kernel only, no separate modules)
         run: |
           set -euo pipefail
           git clone --depth=1 https://github.com/Kernel-SU/AnyKernel3.git /tmp/AnyKernel3
           rm -rf /tmp/AnyKernel3/.git
           cp "kernel_workspace/common/out/${IMAGE_PATH}" /tmp/AnyKernel3/Image
-          
-          # Copy all generated .ko modules for Realtek and CAN drivers
-          mkdir -p /tmp/AnyKernel3/modules/system/lib/modules
-          find kernel_workspace/common/out/ -name "*.ko" -exec cp {} /tmp/AnyKernel3/modules/system/lib/modules/ \; || true
-          
+
           cd /tmp/AnyKernel3
           zip -r9 "${GITHUB_WORKSPACE}/${{ github.event.inputs.device_name }}-kernel.zip" . -x ".git*"
 
